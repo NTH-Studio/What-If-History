@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <title>What If: History</title>
+  <circle cx="32" cy="32" r="27" stroke="#b8843b" stroke-width="3"/>
+  <path d="M7 32h50M32 5c-8 8-12 17-12 27s4 19 12 27" stroke="#234a57" stroke-width="2.5"/>
+  <path d="M32 5c8 8 12 17 12 27" stroke="#234a57" stroke-width="2.5"/>
+  <path d="M44 32c0 8 4 16 12 23M44 32c4 5 9 8 15 10" stroke="#9a3f46" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="44" cy="32" r="3.5" fill="#b8843b"/>
+</svg>

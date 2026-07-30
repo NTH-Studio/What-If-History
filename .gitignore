@@ -1,0 +1,28 @@
+# Dependencies and build outputs
+node_modules/
+dist/
+coverage/
+playwright-report/
+test-results/
+.vite/
+*.tsbuildinfo
+
+# Local configuration and runtime state
+.env
+.env.*
+!.env.example
+data/runtime/
+data/saves/
+data/debug/
+data/llm_settings.json
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.log
+
+# Editors and operating systems
+.codex-remote-attachments/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
