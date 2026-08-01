@@ -55,7 +55,7 @@ describe('API v1', () => {
       .expect(200);
     expect(profile.body).toMatchObject({
       code: 'FRA',
-      dataQuality: 'estimated',
+      dataQuality: 'historical',
       baselineDate: '1936-01-01',
     });
     expect(profile.body.laws).toEqual(
@@ -102,6 +102,199 @@ describe('API v1', () => {
       .expect(200);
     expect(englishCities.body).toContainEqual(
       expect.objectContaining({ id: 'london', name: 'London' }),
+    );
+  });
+
+  it('creates a coherent dated French campaign in 2000', async () => {
+    const recentPreview = await request(context.app)
+      .get('/api/v1/catalog/historical-world?date=2025-01-01')
+      .set('x-what-if-history-language', 'fr')
+      .expect(200);
+    expect(recentPreview.body).toMatchObject({
+      coverageStart: '1870-01-01',
+      coverageEnd: '2026-07-31',
+    });
+    expect(
+      recentPreview.body.nations.find((nation: { code: string }) => nation.code === 'FRA'),
+    ).toMatchObject({
+      officeHolders: [expect.objectContaining({ name: 'Emmanuel Macron', role: 'head_of_state' })],
+    });
+
+    const preview = await request(context.app)
+      .get('/api/v1/catalog/historical-world?date=2000-01-01')
+      .set('x-what-if-history-language', 'fr')
+      .expect(200);
+    const previewFrance = preview.body.nations.find(
+      (nation: { code: string }) => nation.code === 'FRA',
+    );
+    expect(previewFrance).toMatchObject({
+      name: 'République française',
+      capital: 'Paris',
+      officeHolders: [
+        expect.objectContaining({ name: 'Jacques Chirac', role: 'head_of_state' }),
+        expect.objectContaining({ name: 'Lionel Jospin', role: 'head_of_government' }),
+      ],
+    });
+    expect(preview.body.nations.some((nation: { code: string }) => nation.code === 'SOV')).toBe(
+      false,
+    );
+    expect(preview.body.nations.some((nation: { code: string }) => nation.code === 'RUS')).toBe(
+      true,
+    );
+
+    const created = await request(context.app)
+      .post('/api/v1/games')
+      .set('x-what-if-history-language', 'fr')
+      .send({ nationCode: 'FRA', startDate: '2000-01-01' })
+      .expect(201);
+    expect(created.body.playerNation).toMatchObject({
+      code: 'FRA',
+      name: 'République française',
+      leader_name: 'Jacques Chirac',
+    });
+
+    const profile = await request(context.app)
+      .get(`/api/v1/games/${created.body.id}/countries/FRA`)
+      .set('x-what-if-history-language', 'fr')
+      .expect(200);
+    expect(profile.body).toMatchObject({
+      leaderName: 'Jacques Chirac',
+      baselineDate: '2000-01-01',
+      dataQuality: 'historical',
+      indicators: { population: 60_912_500 },
+    });
+    expect(profile.body.officeHolders).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: 'Jacques Chirac' }),
+        expect.objectContaining({ name: 'Lionel Jospin' }),
+      ]),
+    );
+
+    const regions = await request(context.app)
+      .get(`/api/v1/games/${created.body.id}/world/regions`)
+      .expect(200);
+    expect(regions.body).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ regionId: 'Moscow', ownerNationCode: 'RUS' }),
+        expect.objectContaining({ regionId: 'Kyiv', ownerNationCode: 'UKR' }),
+        expect.objectContaining({ regionId: 'Western_Slovakia', ownerNationCode: 'SVK' }),
+      ]),
+    );
+
+    const strategic = await request(context.app)
+      .get(`/api/v1/games/${created.body.id}/strategic-state`)
+      .expect(200);
+    expect(strategic.body.characters).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: 'Jacques Chirac', iconKey: 'leader' }),
+        expect.objectContaining({ name: 'Lionel Jospin' }),
+      ]),
+    );
+    expect(
+      strategic.body.characters.some((character: { name: string }) =>
+        character.name.includes('Albert Lebrun'),
+      ),
+    ).toBe(false);
+    expect(strategic.body.units).toEqual([
+      expect.objectContaining({ nationCode: 'FRA', name: 'Brigade interarmes' }),
+    ]);
+
+    const arsenalRows = context.database
+      .prepare(
+        `SELECT nation_code, nuclear_stockpile FROM strategic_arsenals
+         WHERE game_id = ? AND nation_code IN ('RUS', 'SOV') ORDER BY nation_code`,
+      )
+      .all(created.body.id);
+    expect(arsenalRows).toEqual([{ nation_code: 'RUS', nuclear_stockpile: 6000 }]);
+    const regionalPopulation = context.database
+      .prepare(
+        `SELECT ROUND(SUM(population)) AS population FROM region_states
+         WHERE game_id = ? AND nation_code = 'FRA'`,
+      )
+      .get(created.body.id) as { population: number };
+    expect(regionalPopulation.population).toBe(60_912_500);
+  });
+
+  it('rejects a new historical campaign outside the documented coverage', async () => {
+    const rejected = await request(context.app)
+      .post('/api/v1/games')
+      .send({ nationCode: 'FRA', startDate: '1869-12-31' })
+      .expect(422);
+    expect(rejected.body).toMatchObject({ code: 'HISTORICAL_DATE_OUT_OF_RANGE' });
+  });
+
+  it('persists Gibraltar as a claimed British Overseas Territory in 2020', async () => {
+    const created = await request(context.app)
+      .post('/api/v1/games')
+      .send({ nationCode: 'FRA', startDate: '2020-01-01' })
+      .expect(201);
+    const regions = await request(context.app)
+      .get(`/api/v1/games/${created.body.id}/world/regions`)
+      .expect(200);
+
+    expect(
+      regions.body.find((region: { regionId: string }) => region.regionId === 'Gibraltar'),
+    ).toMatchObject({
+      ownerNationCode: 'ENG',
+      controllerNationCode: 'ENG',
+      territorialStatus: 'overseas_territory',
+      administeringNationCode: 'ENG',
+      claimNationCodes: ['SPR'],
+    });
+  });
+
+  it('applies the dated Gibraltar status transition without changing sovereignty', async () => {
+    const created = await request(context.app)
+      .post('/api/v1/games')
+      .send({ nationCode: 'FRA', startDate: '2002-02-25' })
+      .expect(201);
+
+    await request(context.app)
+      .post(`/api/v1/games/${created.body.id}/turns`)
+      .send({ amount: 1, unit: 'day' })
+      .expect(201);
+
+    const regions = await request(context.app)
+      .get(`/api/v1/games/${created.body.id}/world/regions`)
+      .expect(200);
+    expect(
+      regions.body.find((region: { regionId: string }) => region.regionId === 'Gibraltar'),
+    ).toMatchObject({
+      ownerNationCode: 'ENG',
+      territorialStatus: 'overseas_territory',
+      administeringNationCode: 'ENG',
+      claimNationCodes: ['SPR'],
+    });
+    expect(
+      context.database
+        .prepare(
+          `SELECT status FROM historical_transition_runs
+           WHERE game_id = ? AND transition_id = ?`,
+        )
+        .get(created.body.id, 'territory-status:2002-02-26:Gibraltar:overseas_territory'),
+    ).toEqual({ status: 'applied' });
+  });
+
+  it('re-seeds historical laws with the campaign date after a restart', async () => {
+    const created = await request(context.app)
+      .post('/api/v1/games')
+      .send({ nationCode: 'FRA', startDate: '1936-01-01' })
+      .expect(201);
+
+    context.database
+      .prepare("DELETE FROM country_laws WHERE game_id = ? AND source = 'historical'")
+      .run(created.body.id);
+
+    const restarted = createApp({ database: context.database });
+    const laws = restarted.repository.listCountryLaws(created.body.id, 'FRA', 'fr');
+
+    expect(laws).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          source: 'historical',
+          enactedDate: '1936-01-01',
+        }),
+      ]),
     );
   });
 
@@ -202,6 +395,846 @@ describe('API v1', () => {
     expect(actions.body[0].status).toBe('completed');
   });
 
+  it('exposes a persistent strategic world and keeps movement orders idempotent', async () => {
+    const created = await request(context.app)
+      .post('/api/v1/games')
+      .send({ nationCode: 'FRA', startDate: '1936-01-01' })
+      .expect(201);
+    const gameId = created.body.id as string;
+    const initial = await request(context.app)
+      .get(`/api/v1/games/${gameId}/strategic-state`)
+      .expect(200);
+    const frenchPopulation = initial.body.regions
+      .filter((region: { nationCode: string | null }) => region.nationCode === 'FRA')
+      .reduce((total: number, region: { population: number }) => total + region.population, 0);
+    const nationalPopulation = created.body.nationStates.find(
+      (nation: { nationCode: string }) => nation.nationCode === 'FRA',
+    ).population;
+
+    expect(frenchPopulation).toBe(nationalPopulation);
+    expect(
+      initial.body.regions.find(
+        (region: { regionId: string }) => region.regionId === 'Ile_de_France',
+      ).neighbors,
+    ).toEqual(expect.arrayContaining(['Normandy', 'Champagne']));
+    expect(initial.body.characters).toContainEqual(
+      expect.objectContaining({ nationCode: 'FRA', status: 'active', iconKey: 'leader' }),
+    );
+    const actualUnits = new Map(
+      context.strategic.listUnits(gameId).map((candidate) => [candidate.id, candidate]),
+    );
+    for (const contact of initial.body.contacts) {
+      const actual = actualUnits.get(contact.targetUnitId)!;
+      if (contact.level === 'unknown') {
+        expect(contact.estimatedRegionId).toBeNull();
+        expect(contact.estimatedStrength).toBeNull();
+        expect(
+          initial.body.units.some((candidate: { id: string }) => candidate.id === actual.id),
+        ).toBe(false);
+      }
+      if (contact.level === 'estimated') {
+        expect(contact.estimatedRegionId).not.toBe(actual.regionId);
+      }
+    }
+
+    const unit = initial.body.units.find(
+      (candidate: { nationCode: string; domain: string }) =>
+        candidate.nationCode === 'FRA' && candidate.domain === 'land',
+    );
+    const destination = initial.body.regions.find(
+      (region: { regionId: string; nationCode: string | null; terrain: string }) =>
+        region.nationCode === 'FRA' &&
+        region.regionId !== unit.regionId &&
+        region.terrain !== 'ocean',
+    );
+    context.database
+      .prepare('UPDATE region_states SET neighbors_json = ? WHERE game_id = ? AND region_id = ?')
+      .run(JSON.stringify([destination.regionId]), gameId, unit.regionId);
+    context.database
+      .prepare('UPDATE region_states SET neighbors_json = ? WHERE game_id = ? AND region_id = ?')
+      .run(JSON.stringify([unit.regionId]), gameId, destination.regionId);
+    const orderInput = {
+      unitId: unit.id,
+      type: 'move',
+      destinationRegionId: destination.regionId,
+      directive: 'Rejoindre la position et préserver le ravitaillement.',
+      idempotencyKey: '00000000-0000-4000-8000-000000000111',
+      expectedWorldRevision: initial.body.worldRevision,
+    };
+
+    const preview = await request(context.app)
+      .post(`/api/v1/games/${gameId}/orders/preview`)
+      .send(orderInput)
+      .expect(200);
+    expect(preview.body).toMatchObject({
+      valid: true,
+      route: [unit.regionId, destination.regionId],
+    });
+
+    const first = await request(context.app)
+      .post(`/api/v1/games/${gameId}/orders`)
+      .send(orderInput)
+      .expect(201);
+    const retried = await request(context.app)
+      .post(`/api/v1/games/${gameId}/orders`)
+      .send(orderInput)
+      .expect(201);
+    expect(retried.body.id).toBe(first.body.id);
+    expect(
+      context.database
+        .prepare('SELECT COUNT(*) AS count FROM strategic_orders WHERE game_id = ?')
+        .get(gameId),
+    ).toEqual({ count: 1 });
+
+    await request(context.app)
+      .post(`/api/v1/games/${gameId}/turns`)
+      .send({ amount: 1, unit: 'year' })
+      .expect(201);
+    const after = await request(context.app)
+      .get(`/api/v1/games/${gameId}/strategic-state`)
+      .expect(200);
+    expect(after.body.orders[0]).toMatchObject({ status: 'completed', progress: 1 });
+    expect(
+      after.body.units.find((candidate: { id: string }) => candidate.id === unit.id),
+    ).toMatchObject({ regionId: destination.regionId, mission: 'idle' });
+    const timeline = await request(context.app).get(`/api/v1/games/${gameId}/timeline`).expect(200);
+    expect(timeline.body.map((entry: { kind: string }) => entry.kind)).toEqual(
+      expect.arrayContaining(['movement_started', 'arrival']),
+    );
+  });
+
+  it('keeps durable characters stable across repeated mentions and later updates', async () => {
+    const created = await request(context.app)
+      .post('/api/v1/games')
+      .send({ nationCode: 'FRA', startDate: '1936-01-01' })
+      .expect(201);
+    const gameId = created.body.id as string;
+    const change = {
+      operation: 'create' as const,
+      name: 'Jeanne Mercier',
+      role: 'Envoyee speciale',
+      nation_code: 'FRA',
+      loyalty_nation_code: 'FRA',
+      region_id: 'Ile_de_France',
+    };
+
+    context.strategic.applyCharacterChanges(gameId, [change], '1936-01-02', 2);
+    const first = context.strategic
+      .listCharacters(gameId)
+      .find((character) => character.name === change.name)!;
+    context.strategic.applyCharacterChanges(gameId, [change], '1936-01-03', 3);
+    context.strategic.applyCharacterChanges(
+      gameId,
+      [
+        {
+          operation: 'update',
+          character_id: first.id,
+          status: 'wounded',
+          region_id: 'Normandy',
+        },
+      ],
+      '1936-01-04',
+      4,
+    );
+
+    const matches = context.strategic
+      .listCharacters(gameId)
+      .filter((character) => character.name === change.name);
+    expect(matches).toHaveLength(1);
+    expect(matches[0]).toMatchObject({
+      id: first.id,
+      iconKey: 'diplomat',
+      status: 'wounded',
+      regionId: 'Normandy',
+    });
+    expect(matches[0]!.history).toHaveLength(3);
+  });
+
+  it('applies an exact historical succession once and respects local divergence', async () => {
+    const historical = await request(context.app)
+      .post('/api/v1/games')
+      .send({ nationCode: 'FRA', startDate: '2007-05-15' })
+      .expect(201);
+    const historicalId = historical.body.id as string;
+
+    context.strategic.advanceDailySimulation(historicalId, '2007-05-15', '2007-05-16', 2);
+    context.strategic.advanceDailySimulation(historicalId, '2007-05-15', '2007-05-16', 2);
+
+    const appliedOffice = context.database
+      .prepare(
+        `SELECT holder_id, holder_name FROM game_office_holders
+         WHERE game_id = ? AND office_key = 'FRA:head_of_state'`,
+      )
+      .get(historicalId) as { holder_id: string; holder_name: string };
+    expect(appliedOffice).toEqual({
+      holder_id: 'fra-hos-sarkozy',
+      holder_name: 'Nicolas Sarkozy',
+    });
+    const appliedRuns = context.database
+      .prepare(
+        `SELECT status FROM historical_transition_runs
+         WHERE game_id = ? AND transition_id = 'office:fra-hos-sarkozy'`,
+      )
+      .all(historicalId) as Array<{ status: string }>;
+    expect(appliedRuns).toEqual([{ status: 'applied' }]);
+    expect(
+      context.strategic
+        .listTimeline(historicalId)
+        .filter((entry) => entry.title.includes('Nicolas Sarkozy')),
+    ).toHaveLength(1);
+
+    const divergent = await request(context.app)
+      .post('/api/v1/games')
+      .send({ nationCode: 'FRA', startDate: '2007-05-15' })
+      .expect(201);
+    const divergentId = divergent.body.id as string;
+    context.database
+      .prepare(
+        `UPDATE historical_continuity SET continuity_status = 'diverged',
+         diverged_at = '2007-05-15', reason = 'Player removed the president'
+         WHERE game_id = ? AND entity_type = 'office' AND entity_id = 'FRA:head_of_state'`,
+      )
+      .run(divergentId);
+
+    context.strategic.advanceDailySimulation(divergentId, '2007-05-15', '2007-05-16', 2);
+
+    const preservedOffice = context.database
+      .prepare(
+        `SELECT holder_id FROM game_office_holders
+         WHERE game_id = ? AND office_key = 'FRA:head_of_state'`,
+      )
+      .get(divergentId) as { holder_id: string };
+    expect(preservedOffice.holder_id).toBe('fra-hos-chirac');
+    const skippedRun = context.database
+      .prepare(
+        `SELECT status FROM historical_transition_runs
+         WHERE game_id = ? AND transition_id = 'office:fra-hos-sarkozy'`,
+      )
+      .get(divergentId) as { status: string };
+    expect(skippedRun.status).toBe('skipped_divergence');
+
+    const reunification = await request(context.app)
+      .post('/api/v1/games')
+      .send({ nationCode: 'GER', startDate: '1990-10-02' })
+      .expect(201);
+    const reunificationId = reunification.body.id as string;
+    context.database
+      .prepare(
+        `UPDATE game_regions SET owner_nation_code = 'FRA', controller_nation_code = 'FRA'
+         WHERE game_id = ? AND region_id = 'Brandenburg'`,
+      )
+      .run(reunificationId);
+    context.database
+      .prepare(
+        `UPDATE region_states SET nation_code = 'FRA'
+         WHERE game_id = ? AND region_id = 'Brandenburg'`,
+      )
+      .run(reunificationId);
+    context.database
+      .prepare(
+        `UPDATE historical_continuity SET continuity_status = 'diverged',
+         diverged_at = '1990-10-02', reason = 'Custom territorial override'
+         WHERE game_id = ? AND entity_type = 'region' AND entity_id = 'Brandenburg'`,
+      )
+      .run(reunificationId);
+
+    context.strategic.advanceDailySimulation(reunificationId, '1990-10-02', '1990-10-03', 2);
+
+    const reunitedRegions = new Map(
+      context.strategic
+        .listRegions(reunificationId)
+        .map((region) => [region.regionId, region.nationCode]),
+    );
+    expect(reunitedRegions.get('Brandenburg')).toBe('FRA');
+    expect(reunitedRegions.get('Mecklenburg')).toBe('GER');
+  });
+
+  it('degrades an isolated unit when its regional supply line is cut', async () => {
+    const created = await request(context.app)
+      .post('/api/v1/games')
+      .send({ nationCode: 'FRA', startDate: '1936-01-01' })
+      .expect(201);
+    const gameId = created.body.id as string;
+    const unit = context.strategic
+      .listUnits(gameId)
+      .find((candidate) => candidate.nationCode === 'FRA' && candidate.domain === 'land')!;
+    context.database
+      .prepare('UPDATE region_states SET supply = 0 WHERE game_id = ? AND region_id = ?')
+      .run(gameId, unit.regionId);
+    const before = context.strategic
+      .listUnits(gameId)
+      .find((candidate) => candidate.id === unit.id)!;
+
+    context.strategic.advanceDailySimulation(gameId, '1936-01-01', '1936-01-08', 2);
+
+    const after = context.strategic
+      .listUnits(gameId)
+      .find((candidate) => candidate.id === unit.id)!;
+    expect(after.supply).toBeLessThan(before.supply);
+    expect(after.organization).toBeLessThan(before.organization);
+    expect(after.morale).toBeLessThan(before.morale);
+  });
+
+  it('creates a battle instead of a fictitious arrival when an attack is intercepted', async () => {
+    const created = await request(context.app)
+      .post('/api/v1/games')
+      .send({ nationCode: 'FRA', startDate: '1936-01-01' })
+      .expect(201);
+    const gameId = created.body.id as string;
+    const state = context.strategic.getState(gameId);
+    const attacker = context.strategic
+      .listUnits(gameId)
+      .find((unit) => unit.nationCode === 'FRA' && unit.domain === 'land')!;
+    const defender = context.strategic
+      .listUnits(gameId)
+      .find((unit) => unit.nationCode === 'GER' && unit.domain === 'land')!;
+    context.database
+      .prepare('UPDATE region_states SET neighbors_json = ? WHERE game_id = ? AND region_id = ?')
+      .run(JSON.stringify([defender.regionId]), gameId, attacker.regionId);
+    context.database
+      .prepare('UPDATE region_states SET neighbors_json = ? WHERE game_id = ? AND region_id = ?')
+      .run(JSON.stringify([attacker.regionId]), gameId, defender.regionId);
+    context.database
+      .prepare('UPDATE units SET strength = 8, manpower = 800, organization = 20 WHERE id = ?')
+      .run(attacker.id);
+    context.database
+      .prepare('UPDATE units SET strength = 100, manpower = 25000, organization = 100 WHERE id = ?')
+      .run(defender.id);
+
+    const order = await request(context.app)
+      .post(`/api/v1/games/${gameId}/orders`)
+      .send({
+        unitId: attacker.id,
+        type: 'attack',
+        destinationRegionId: defender.regionId,
+        directive: 'Tester les defenses puis rompre le contact.',
+        idempotencyKey: '00000000-0000-4000-8000-000000000333',
+        expectedWorldRevision: state.worldRevision,
+      })
+      .expect(201);
+
+    context.strategic.advanceDailySimulation(gameId, '1936-01-01', '1937-01-01', 2);
+
+    const completed = context.strategic
+      .listOrders(gameId)
+      .find((candidate) => candidate.id === order.body.id)!;
+    const attackerAfter = context.strategic
+      .listUnits(gameId)
+      .find((candidate) => candidate.id === attacker.id)!;
+    const entries = context.strategic
+      .listTimeline(gameId)
+      .filter((entry) => entry.entityIds.includes(order.body.id));
+    expect(completed.status).toBe('intercepted');
+    expect(attackerAfter.regionId).toBe(attacker.regionId);
+    expect(entries.map((entry) => entry.kind)).toEqual(
+      expect.arrayContaining(['movement_started', 'interception', 'battle']),
+    );
+    expect(entries.some((entry) => entry.kind === 'arrival')).toBe(false);
+  });
+
+  it('applies a structured nuclear strike to regional and national population exactly once', async () => {
+    const created = await request(context.app)
+      .post('/api/v1/games')
+      .send({ nationCode: 'USA', startDate: '1964-01-01' })
+      .expect(201);
+    const gameId = created.body.id as string;
+    const before = context.strategic.getState(gameId);
+    const target = before.regions
+      .filter((region) => region.nationCode === 'ENG')
+      .sort((left, right) => right.population - left.population)[0]!;
+    const nationalBefore = context.repository
+      .getNationStates(gameId)
+      .find((nation) => nation.nationCode === 'ENG')!.population;
+    const event = {
+      id: '00000000-0000-4000-8000-000000000222',
+      gameId,
+      title: 'Frappe nucléaire sur Londres',
+      description: 'Une arme nucléaire explose sur la capitale britannique.',
+      event_type: 'military' as const,
+      severity: 'critical' as const,
+      affected_nations: ['USA', 'ENG'],
+      state_changes: {},
+      map_cue: {
+        camera: 'auto' as const,
+        locations: [
+          { kind: 'region' as const, role: 'primary' as const, region_id: target.regionId },
+        ],
+      },
+      subtype: 'nuclear_strike',
+      icon_key: 'nuclear_strike',
+      strategic_effect: {
+        kind: 'nuclear_strike' as const,
+        intensity: 100,
+        target_region_id: target.regionId,
+        source_nation_code: 'USA',
+        vector: 'ballistic_missile' as const,
+        editor_override: false,
+      },
+      gameDate: '1964-01-02',
+      createdAt: '1964-01-02T00:00:00.000Z',
+      turnNumber: 2,
+    };
+
+    context.database
+      .prepare(
+        `INSERT INTO events (
+          id, game_id, title, description, event_type, severity, affected_nations,
+          state_changes, map_cue, subtype, icon_key, strategic_effect,
+          game_date, created_at, turn_number
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        event.id,
+        gameId,
+        event.title,
+        event.description,
+        event.event_type,
+        event.severity,
+        JSON.stringify(event.affected_nations),
+        '{}',
+        JSON.stringify(event.map_cue),
+        event.subtype,
+        event.icon_key,
+        JSON.stringify(event.strategic_effect),
+        event.gameDate,
+        event.createdAt,
+        event.turnNumber,
+      );
+    context.strategic.appendEventTimeline(gameId, event);
+    const after = context.strategic.getState(gameId);
+    const changedTarget = after.regions.find((region) => region.regionId === target.regionId)!;
+    const nationalAfter = context.repository
+      .getNationStates(gameId)
+      .find((nation) => nation.nationCode === 'ENG')!.population;
+
+    expect(changedTarget.population).toBeLessThan(target.population);
+    expect(changedTarget.habitability).toBeLessThan(20);
+    expect(changedTarget.radiation).toBe(100);
+    expect(nationalAfter).toBeLessThan(nationalBefore);
+    expect(after.impactZones).toContainEqual(
+      expect.objectContaining({ kind: 'nuclear_strike', sourceEventId: event.id, active: true }),
+    );
+    expect(context.strategic.listTimeline(gameId)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ eventId: event.id, kind: 'impact' }),
+        expect.objectContaining({
+          eventId: event.id,
+          consequences: expect.objectContaining({ uninhabitable: true }),
+        }),
+      ]),
+    );
+
+    context.strategic.listTimeline(gameId);
+    expect(
+      context.strategic
+        .getState(gameId)
+        .regions.find((region) => region.regionId === target.regionId)?.population,
+    ).toBe(changedTarget.population);
+
+    const narrativeOnlyEvent = { ...event, strategic_effect: undefined };
+    expect(() =>
+      context.strategic.appendEventTimeline(gameId, {
+        ...narrativeOnlyEvent,
+        id: '00000000-0000-4000-8000-000000000223',
+      }),
+    ).toThrowError(/cible, un vecteur et des effets structurés/);
+  });
+
+  it('uses the requested date in a historical campaign context', async () => {
+    const created = await request(context.app)
+      .post('/api/v1/games')
+      .send({ nationCode: 'FRA', startDate: '2000-01-01' })
+      .expect(201);
+
+    expect(created.body).toMatchObject({
+      currentDate: '2000-01-01',
+      scenarioMode: 'historical',
+    });
+    expect(created.body.worldContext).toContain('2000-01-01');
+    expect(created.body.worldContext).not.toContain('1936');
+  });
+
+  it('keeps an AI feasibility rejection consultative instead of vetoing the player', async () => {
+    const created = await request(context.app)
+      .post('/api/v1/games')
+      .send({ nationCode: 'FRA', startDate: '2000-01-01' })
+      .expect(201);
+
+    const action = await request(context.app)
+      .post(`/api/v1/games/${created.body.id}/actions`)
+      .set('x-what-if-history-language', 'fr')
+      .send({ actionText: 'FORCE_REJECT_FOR_TEST', actionType: 'general' })
+      .expect(201);
+
+    expect(action.body).toMatchObject({
+      status: 'pending',
+      effectStatus: 'queued',
+    });
+    expect(action.body.aiResponse).toContain('Avis consultatif de l’IA');
+    expect(action.body.aiResponse).toContain('Avertissement de faisabilité simulé');
+  });
+
+  it('previews and applies giving Paris to Germany on the next turn only', async () => {
+    const created = await request(context.app)
+      .post('/api/v1/games')
+      .send({ nationCode: 'FRA', startDate: '1936-01-01' })
+      .expect(201);
+    const gameId = created.body.id as string;
+
+    const preview = await request(context.app)
+      .post(`/api/v1/games/${gameId}/actions/preview`)
+      .set('x-what-if-history-language', 'fr')
+      .send({ actionText: "donner Paris à l'Allemagne", actionType: 'general' })
+      .expect(200);
+
+    expect(preview.body).toMatchObject({
+      effects: [
+        {
+          kind: 'territory',
+          operation: 'cede',
+          regionId: 'Ile_de_France',
+          nationCode: 'GER',
+        },
+      ],
+      ambiguities: [],
+      worldRevision: 0,
+    });
+
+    const action = await request(context.app)
+      .post(`/api/v1/games/${gameId}/actions`)
+      .send({
+        actionText: "donner Paris à l'Allemagne",
+        actionType: 'general',
+        effects: preview.body.effects,
+        previewWorldRevision: preview.body.worldRevision,
+      })
+      .expect(201);
+    expect(action.body.effectStatus).toBe('queued');
+
+    const beforeTurn = await request(context.app)
+      .get(`/api/v1/games/${gameId}/world/regions`)
+      .expect(200);
+    expect(
+      beforeTurn.body.find((region: { regionId: string }) => region.regionId === 'Ile_de_France'),
+    ).toMatchObject({ ownerNationCode: 'FRA', controllerNationCode: 'FRA' });
+
+    const turn = await request(context.app)
+      .post(`/api/v1/games/${gameId}/turns`)
+      .send({ amount: 1, unit: 'month' })
+      .expect(201);
+
+    expect(turn.body.worldRevision).toBe(1);
+    expect(turn.body.appliedMutations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          turnNumber: 1,
+          source: 'player_action',
+          sourceActionId: action.body.id,
+          mutationType: 'region',
+          targetId: 'Ile_de_France',
+          worldRevision: 1,
+        }),
+        expect.objectContaining({
+          source: 'player_action',
+          mutationType: 'capital',
+          targetId: 'FRA',
+        }),
+      ]),
+    );
+
+    const afterTurn = await request(context.app)
+      .get(`/api/v1/games/${gameId}/world/regions`)
+      .expect(200);
+    expect(
+      afterTurn.body.find((region: { regionId: string }) => region.regionId === 'Ile_de_France'),
+    ).toMatchObject({ ownerNationCode: 'GER', controllerNationCode: 'GER' });
+
+    const france = await request(context.app)
+      .get(`/api/v1/games/${gameId}/countries/FRA`)
+      .expect(200);
+    expect(france.body).toMatchObject({ capital: null, capitalStatus: 'lost' });
+
+    const features = await request(context.app)
+      .get(`/api/v1/games/${gameId}/world/features`)
+      .expect(200);
+    expect(
+      features.body.find((feature: { name: string }) => feature.name === 'Paris'),
+    ).toMatchObject({ nationCode: 'GER', featureType: 'city', regionId: 'Ile_de_France' });
+  });
+
+  it('recognizes England without treating the selected region owner as the recipient', async () => {
+    const created = await request(context.app)
+      .post('/api/v1/games')
+      .send({ nationCode: 'FRA', startDate: '1936-01-01' })
+      .expect(201);
+
+    const preview = await request(context.app)
+      .post(`/api/v1/games/${created.body.id}/actions/preview`)
+      .set('x-what-if-history-language', 'fr')
+      .send({
+        actionText: "donner a l'Angleterre\n\nContexte cartographique : ★ Paris (FRA).",
+        actionType: 'general',
+        context: { regionId: 'Ile_de_France' },
+      })
+      .expect(200);
+
+    expect(preview.body).toMatchObject({
+      effects: [
+        {
+          kind: 'territory',
+          operation: 'cede',
+          regionId: 'Ile_de_France',
+          nationCode: 'ENG',
+        },
+      ],
+      ambiguities: [],
+    });
+
+    const action = await request(context.app)
+      .post(`/api/v1/games/${created.body.id}/actions`)
+      .send({
+        actionText: preview.body.actionText,
+        actionType: 'general',
+        effects: preview.body.effects,
+        previewWorldRevision: preview.body.worldRevision,
+      })
+      .expect(201);
+
+    expect(action.body).toMatchObject({
+      status: 'pending',
+      effectStatus: 'queued',
+      effects: preview.body.effects,
+    });
+    expect(
+      context.repository
+        .listLlmCalls({ gameId: created.body.id, limit: 10 })
+        .filter((call) => call.type === 'action_validation'),
+    ).toHaveLength(0);
+  });
+
+  it('accepts an ambiguous v3 action without inventing a guaranteed world effect', async () => {
+    const created = await request(context.app)
+      .post('/api/v1/games')
+      .send({ nationCode: 'FRA', startDate: '1936-01-01' })
+      .expect(201);
+
+    const action = await request(context.app)
+      .post(`/api/v1/games/${created.body.id}/actions`)
+      .send({ actionText: "donner a l'Angleterre", actionType: 'general' })
+      .expect(201);
+
+    expect(action.body).toMatchObject({
+      actionText: "donner a l'Angleterre",
+      effects: [],
+      previewWorldRevision: 0,
+    });
+  });
+
+  it('returns the same committed turn for a repeated idempotency key', async () => {
+    const created = await request(context.app)
+      .post('/api/v1/games')
+      .send({ nationCode: 'FRA', startDate: '1936-01-01' })
+      .expect(201);
+    const key = '10000000-0000-4000-8000-000000000099';
+    const first = await request(context.app)
+      .post(`/api/v1/games/${created.body.id}/turns`)
+      .set('x-idempotency-key', key)
+      .send({ amount: 1, unit: 'month' })
+      .expect(201);
+    const retry = await request(context.app)
+      .post(`/api/v1/games/${created.body.id}/turns`)
+      .set('x-idempotency-key', key)
+      .send({ amount: 1, unit: 'month' })
+      .expect(201);
+
+    expect(retry.body).toEqual(first.body);
+    expect(context.repository.getGame(created.body.id)).toMatchObject({
+      turnNumber: 2,
+      worldRevision: 1,
+    });
+  });
+
+  it('keeps legal ownership, military control, claims and capital status distinct', async () => {
+    const created = await request(context.app)
+      .post('/api/v1/games')
+      .send({ nationCode: 'FRA', startDate: '1936-01-01' })
+      .expect(201);
+    const gameId = created.body.id as string;
+
+    const queue = async (actionText: string) => {
+      const preview = await request(context.app)
+        .post(`/api/v1/games/${gameId}/actions/preview`)
+        .send({ actionText, actionType: 'general' })
+        .expect(200);
+      expect(preview.body.ambiguities).toEqual([]);
+      await request(context.app)
+        .post(`/api/v1/games/${gameId}/actions`)
+        .send({
+          actionText,
+          actionType: 'general',
+          effects: preview.body.effects,
+          previewWorldRevision: preview.body.worldRevision,
+        })
+        .expect(201);
+      return preview.body.effects;
+    };
+    const advance = () =>
+      request(context.app)
+        .post(`/api/v1/games/${gameId}/turns`)
+        .send({ amount: 1, unit: 'month' })
+        .expect(201);
+    const region = async (regionId: string) => {
+      const response = await request(context.app)
+        .get(`/api/v1/games/${gameId}/world/regions`)
+        .expect(200);
+      return response.body.find(
+        (candidate: { regionId: string }) => candidate.regionId === regionId,
+      );
+    };
+
+    expect(await queue("occuper Paris avec l'Allemagne")).toEqual([
+      expect.objectContaining({
+        operation: 'occupy',
+        regionId: 'Ile_de_France',
+        nationCode: 'GER',
+      }),
+    ]);
+    await advance();
+    expect(await region('Ile_de_France')).toMatchObject({
+      ownerNationCode: 'FRA',
+      controllerNationCode: 'GER',
+    });
+    expect(
+      await request(context.app).get(`/api/v1/games/${gameId}/countries/FRA`).expect(200),
+    ).toMatchObject({
+      body: expect.objectContaining({ capital: 'Paris', capitalStatus: 'occupied' }),
+    });
+
+    await queue('libérer Paris');
+    await advance();
+    expect(await region('Ile_de_France')).toMatchObject({
+      ownerNationCode: 'FRA',
+      controllerNationCode: 'FRA',
+    });
+    expect(
+      await request(context.app).get(`/api/v1/games/${gameId}/countries/FRA`).expect(200),
+    ).toMatchObject({
+      body: expect.objectContaining({ capital: 'Paris', capitalStatus: 'established' }),
+    });
+
+    await queue("annexer l'Alsace Lorraine à l'Allemagne");
+    await advance();
+    expect(await region('Alsace_Lorraine')).toMatchObject({
+      ownerNationCode: 'GER',
+      controllerNationCode: 'GER',
+      claimNationCodes: expect.arrayContaining(['FRA']),
+    });
+
+    await queue("revendiquer l'Alsace Lorraine pour l'Allemagne");
+    await queue("revendiquer l'Alsace Lorraine pour l'Italie");
+    await advance();
+    expect(await region('Alsace_Lorraine')).toMatchObject({
+      ownerNationCode: 'GER',
+      controllerNationCode: 'GER',
+      claimNationCodes: expect.arrayContaining(['FRA', 'ITA']),
+    });
+  });
+
+  it('rejects an action confirmed against a stale world revision', async () => {
+    const created = await request(context.app)
+      .post('/api/v1/games')
+      .send({ nationCode: 'FRA', startDate: '1936-01-01' })
+      .expect(201);
+    const gameId = created.body.id as string;
+    const preview = await request(context.app)
+      .post(`/api/v1/games/${gameId}/actions/preview`)
+      .send({ actionText: "donner Paris à l'Allemagne", actionType: 'general' })
+      .expect(200);
+
+    await request(context.app)
+      .patch(`/api/v1/games/${gameId}/world/regions/Alsace_Lorraine`)
+      .send({ controllerNationCode: 'GER' })
+      .expect(200);
+
+    const stale = await request(context.app)
+      .post(`/api/v1/games/${gameId}/actions`)
+      .send({
+        actionText: "donner Paris à l'Allemagne",
+        actionType: 'general',
+        effects: preview.body.effects,
+        previewWorldRevision: preview.body.worldRevision,
+      })
+      .expect(409);
+    expect(stale.body.code).toBe('WORLD_REVISION_CONFLICT');
+  });
+
+  it('restores a pre-v4 snapshot with safe controller, claim and capital defaults', async () => {
+    const created = await request(context.app)
+      .post('/api/v1/games')
+      .send({ nationCode: 'FRA', startDate: '1936-01-01' })
+      .expect(201);
+    const gameId = created.body.id as string;
+    const snapshot = context.advanced.createSnapshot(gameId, 'Legacy snapshot');
+    const row = context.database
+      .prepare('SELECT payload FROM game_snapshots WHERE id = ?')
+      .get(snapshot.id) as { payload: string };
+    const payload = JSON.parse(row.payload) as {
+      game: Record<string, unknown>;
+      nationStates: Array<Record<string, unknown>>;
+      actions: Array<Record<string, unknown>>;
+      regions: Array<Record<string, unknown>>;
+      mutations: Array<Record<string, unknown>>;
+    };
+    delete payload.game.world_revision;
+    for (const state of payload.nationStates) {
+      delete state.capital_feature_id;
+      delete state.capital_status;
+    }
+    for (const action of payload.actions) {
+      delete action.effects_json;
+      delete action.effect_status;
+      delete action.preview_world_revision;
+    }
+    for (const region of payload.regions) {
+      delete region.controller_nation_code;
+      delete region.claim_nation_codes;
+    }
+    for (const mutation of payload.mutations) {
+      delete mutation.mutation_source;
+      delete mutation.source_action_id;
+      delete mutation.source_event_id;
+      delete mutation.effect_json;
+      delete mutation.world_revision;
+    }
+    context.database
+      .prepare('UPDATE game_snapshots SET payload = ? WHERE id = ?')
+      .run(JSON.stringify(payload), snapshot.id);
+
+    await request(context.app)
+      .patch(`/api/v1/games/${gameId}/world/regions/Ile_de_France`)
+      .send({ ownerNationCode: 'GER', controllerNationCode: 'GER', claimNationCodes: ['FRA'] })
+      .expect(200);
+    const restored = await request(context.app)
+      .post(`/api/v1/games/${gameId}/snapshots/${snapshot.id}/restore`)
+      .expect(200);
+    expect(restored.body.worldRevision).toBe(2);
+
+    const regions = await request(context.app)
+      .get(`/api/v1/games/${gameId}/world/regions`)
+      .expect(200);
+    expect(
+      regions.body.find((region: { regionId: string }) => region.regionId === 'Ile_de_France'),
+    ).toMatchObject({
+      ownerNationCode: 'FRA',
+      controllerNationCode: 'FRA',
+      claimNationCodes: [],
+    });
+    const france = await request(context.app)
+      .get(`/api/v1/games/${gameId}/countries/FRA`)
+      .expect(200);
+    expect(france.body).toMatchObject({ capital: 'Paris', capitalStatus: 'established' });
+  });
+
   it('creates and lists an active custom scenario without calling the LLM', async () => {
     const premise = 'Une épidémie mondiale frappe tous les continents en 1936.';
     const created = await request(context.app)
@@ -265,8 +1298,14 @@ describe('API v1', () => {
       actionType: 'law',
       status: 'pending',
       aiResponse:
-        'Promulguée sans vote. La loi est déjà en vigueur ; ses conséquences seront simulées au prochain tour.',
+        'Promulguée sans vote. La loi est mise en file et entrera en vigueur au prochain tour.',
     });
+    const beforeTurn = await request(context.app)
+      .get(`/api/v1/games/${created.body.id}/countries/FRA`)
+      .expect(200);
+    expect(beforeTurn.body.laws).not.toContainEqual(
+      expect.objectContaining({ title: 'Rendre la vaccination obligatoire.' }),
+    );
     expect(context.repository.listLlmCalls({ limit: 100 })).toHaveLength(0);
 
     await request(context.app)
@@ -283,6 +1322,16 @@ describe('API v1', () => {
       .expect(200);
     expect(actions.body).toContainEqual(
       expect.objectContaining({ id: law.body.id, actionType: 'law', status: 'completed' }),
+    );
+    const afterTurn = await request(context.app)
+      .get(`/api/v1/games/${created.body.id}/countries/FRA`)
+      .expect(200);
+    expect(afterTurn.body.laws).toContainEqual(
+      expect.objectContaining({
+        title: 'Rendre la vaccination obligatoire.',
+        status: 'active',
+        source: 'player',
+      }),
     );
   });
 
@@ -354,9 +1403,70 @@ describe('API v1', () => {
 
   it('never exposes the stored API key', async () => {
     const response = await request(context.app).get('/api/v1/llm/settings').expect(200);
-    expect(response.body).toMatchObject({ hasApiKey: true });
+    expect(response.body).toMatchObject({
+      hasApiKey: true,
+      structuredOutputMode: 'server_validation',
+    });
     expect(JSON.stringify(response.body)).not.toContain('secret-test-key');
     expect(response.body).not.toHaveProperty('apiKey');
+  });
+
+  it('rejects the deterministic test provider outside isolated test servers', async () => {
+    const guarded = createApp({ database: openDatabase(':memory:'), environment: 'development' });
+    try {
+      const rejectedSettings = await request(guarded.app)
+        .patch('/api/v1/llm/settings')
+        .send({
+          provider: 'fake',
+          apiUrl: 'http://127.0.0.1:9/v1',
+          apiKey: '',
+          model: 'deterministic-debug',
+          clearApiKey: true,
+        })
+        .expect(409);
+      expect(rejectedSettings.body.code).toBe('FAKE_LLM_PROVIDER_DISABLED');
+      expect(guarded.repository.getLlmSettingsPrivate().provider).toBe('lm-studio');
+
+      guarded.repository.saveLlmSettings({
+        provider: 'fake',
+        apiUrl: 'http://127.0.0.1:9/v1',
+        apiKey: '',
+        model: 'deterministic-debug',
+        clearApiKey: true,
+      });
+      const created = await request(guarded.app)
+        .post('/api/v1/games')
+        .send({ nationCode: 'FRA', startDate: '1936-01-01' })
+        .expect(201);
+      const rejectedTurn = await request(guarded.app)
+        .post(`/api/v1/games/${created.body.id}/turns`)
+        .send({ amount: 1, unit: 'month' })
+        .expect(409);
+      expect(rejectedTurn.body.code).toBe('FAKE_LLM_PROVIDER_DISABLED');
+      expect(guarded.repository.getGame(created.body.id).turnNumber).toBe(1);
+      expect(guarded.repository.listEvents(created.body.id)).toHaveLength(0);
+    } finally {
+      guarded.database.close();
+    }
+  });
+
+  it('keeps the stored API key when an empty password field is saved', async () => {
+    const saved = await request(context.app)
+      .patch('/api/v1/llm/settings')
+      .send({
+        provider: 'ollama',
+        apiUrl: 'https://ollama.com/api',
+        apiKey: '',
+        model: 'glm-5.2:cloud',
+        clearApiKey: false,
+      })
+      .expect(200);
+    expect(saved.body.structuredOutputMode).toBe('server_validation');
+
+    expect(context.repository.getLlmSettingsPrivate()).toMatchObject({
+      provider: 'ollama',
+      apiKey: 'secret-test-key',
+    });
   });
 
   it('tracks every LLM call type globally without exposing request content or client IDs', async () => {
@@ -479,6 +1589,9 @@ describe('API v1', () => {
     expect(sameOrigin.headers['content-security-policy']).not.toContain(
       'upgrade-insecure-requests',
     );
+    expect(sameOrigin.headers['permissions-policy']).toBe(
+      'camera=(), geolocation=(), microphone=()',
+    );
 
     const rejected = await request(context.app)
       .get('/api/v1/health')
@@ -506,6 +1619,247 @@ describe('API v1', () => {
         count: number;
       };
       expect(Number(row.count)).toBe(0);
+    }
+  });
+
+  it('runs connection, action and turn routes through the native Ollama Cloud contract', async () => {
+    const receivedPaths: string[] = [];
+    const receivedAuthorizations: string[] = [];
+    const receivedBodies: Array<Record<string, unknown>> = [];
+    const provider = createServer((providerRequest, response) => {
+      let body = '';
+      providerRequest.setEncoding('utf8');
+      providerRequest.on('data', (chunk: string) => {
+        body += chunk;
+      });
+      providerRequest.on('end', () => {
+        const payload = JSON.parse(body) as {
+          options?: { num_predict?: number };
+        };
+        receivedPaths.push(providerRequest.url ?? '');
+        receivedAuthorizations.push(providerRequest.headers.authorization ?? '');
+        receivedBodies.push(payload as Record<string, unknown>);
+
+        let content: string;
+        switch (payload.options?.num_predict) {
+          case 10:
+            content = 'OK';
+            break;
+          case 300:
+            content = JSON.stringify({ accepted: true, reason: 'Action accepted.' });
+            break;
+          case 1_500:
+            content = JSON.stringify({
+              time_advance_amount: 7,
+              events: [
+                {
+                  title: 'Native Ollama route verified',
+                  description: 'The isolated campaign advanced through the Ollama chat API.',
+                  event_type: 'military',
+                  severity: 'minor',
+                  affected_nations: ['FRA'],
+                  state_changes: {},
+                  map_cue: {
+                    locations: [{ role: 'primary', kind: 'nation', nation_code: 'FRA' }],
+                    camera: 'nation',
+                  },
+                },
+              ],
+              law_changes: [],
+              region_changes: [],
+              unit_changes: [],
+              map_feature_changes: [],
+            });
+            break;
+          default:
+            response.statusCode = 500;
+            response.end();
+            return;
+        }
+
+        response.setHeader('content-type', 'application/json');
+        response.end(
+          JSON.stringify({
+            message: { role: 'assistant', content },
+            prompt_eval_count: 20,
+            eval_count: 10,
+            done: true,
+          }),
+        );
+      });
+    });
+    provider.listen(0, '127.0.0.1');
+    await once(provider, 'listening');
+    const address = provider.address();
+    if (!address || typeof address === 'string') throw new Error('Mock server did not bind.');
+    const apiUrl = `http://127.0.0.1:${address.port}/api`;
+
+    try {
+      context.repository.saveLlmSettings({
+        provider: 'ollama',
+        apiUrl,
+        apiKey: 'stored-ollama-key',
+        model: 'integration:cloud',
+        clearApiKey: false,
+      });
+
+      await request(context.app)
+        .post('/api/v1/llm/settings/test')
+        .send({
+          provider: 'ollama',
+          apiUrl,
+          model: 'integration:cloud',
+          clearApiKey: false,
+        })
+        .expect(200)
+        .expect(({ body }) => {
+          expect(body).toMatchObject({
+            success: true,
+            model: 'integration:cloud',
+            response: 'OK',
+          });
+        });
+
+      const created = await request(context.app)
+        .post('/api/v1/games')
+        .send({ nationCode: 'FRA', startDate: '1936-01-01' })
+        .expect(201);
+
+      await request(context.app)
+        .post(`/api/v1/games/${created.body.id}/actions`)
+        .send({ actionText: 'Reinforce the eastern frontier.', actionType: 'military' })
+        .expect(201);
+
+      await request(context.app)
+        .post(`/api/v1/games/${created.body.id}/turns`)
+        .send({ amount: 1, unit: 'week' })
+        .expect(201)
+        .expect(({ body }) => {
+          expect(body).toMatchObject({
+            previousDate: '1936-01-01',
+            newDate: '1936-01-08',
+            turnNumber: 2,
+            processedActions: 1,
+          });
+          expect(body.events).toContainEqual(
+            expect.objectContaining({ title: 'Native Ollama route verified' }),
+          );
+        });
+
+      expect(receivedPaths).toEqual(['/api/chat', '/api/chat', '/api/chat']);
+      expect(receivedAuthorizations).toEqual([
+        'Bearer stored-ollama-key',
+        'Bearer stored-ollama-key',
+        'Bearer stored-ollama-key',
+      ]);
+      expect(receivedBodies.every((body) => body.think === false)).toBe(true);
+      expect(receivedBodies.every((body) => !Object.hasOwn(body, 'format'))).toBe(true);
+
+      const activity = context.repository
+        .listLlmCalls({ gameId: created.body.id, limit: 10 })
+        .map((item) => ({ type: item.type, status: item.status, errorCode: item.errorCode }));
+      expect(activity).toEqual([
+        { type: 'turn_generation', status: 'succeeded', errorCode: null },
+        { type: 'action_validation', status: 'succeeded', errorCode: null },
+      ]);
+    } finally {
+      await new Promise<void>((resolve) => provider.close(() => resolve()));
+    }
+  });
+
+  it('preserves valid turn fields when Ollama Cloud returns a partial repair', async () => {
+    let receivedCalls = 0;
+    const receivedSystemPrompts: string[] = [];
+    const provider = createServer((providerRequest, response) => {
+      let body = '';
+      providerRequest.setEncoding('utf8');
+      providerRequest.on('data', (chunk: string) => {
+        body += chunk;
+      });
+      providerRequest.on('end', () => {
+        const payload = JSON.parse(body) as {
+          messages: Array<{ role: string; content: string }>;
+        };
+        receivedCalls += 1;
+        receivedSystemPrompts.push(payload.messages[0]?.content ?? '');
+
+        const content =
+          receivedCalls === 1
+            ? {
+                time_advance_amount: 1,
+                events: [
+                  {
+                    title: 'Réponse initiale conservée',
+                    description:
+                      'Les champs valides de la première réponse restent présents après réparation.',
+                    event_type: 'political',
+                    severity: 'minor',
+                    affected_nations: ['FRA'],
+                    state_changes: {},
+                    map_cue: {
+                      locations: [{ role: 'primary', kind: 'nation', nation_code: 'FRA' }],
+                      camera: 'nation',
+                    },
+                  },
+                ],
+                law_changes: [{}],
+              }
+            : {
+                law_changes: [],
+                region_changes: [],
+                unit_changes: [],
+                map_feature_changes: [],
+              };
+
+        response.setHeader('content-type', 'application/json');
+        response.end(
+          JSON.stringify({
+            message: { role: 'assistant', content: JSON.stringify(content) },
+            prompt_eval_count: 20,
+            eval_count: 10,
+            done: true,
+          }),
+        );
+      });
+    });
+    provider.listen(0, '127.0.0.1');
+    await once(provider, 'listening');
+    const address = provider.address();
+    if (!address || typeof address === 'string') throw new Error('Mock server did not bind.');
+    const apiUrl = `http://127.0.0.1:${address.port}/api`;
+
+    try {
+      context.repository.saveLlmSettings({
+        provider: 'ollama',
+        apiUrl,
+        apiKey: 'stored-ollama-key',
+        model: 'partial-repair:cloud',
+        clearApiKey: false,
+      });
+      const created = await request(context.app)
+        .post('/api/v1/games')
+        .send({ nationCode: 'FRA', startDate: '2000-01-01' })
+        .expect(201);
+
+      await request(context.app)
+        .post(`/api/v1/games/${created.body.id}/turns`)
+        .send({ amount: 1, unit: 'day' })
+        .expect(201)
+        .expect(({ body }) => {
+          expect(body).toMatchObject({
+            previousDate: '2000-01-01',
+            newDate: '2000-01-02',
+            turnNumber: 2,
+          });
+          expect(body.events).toContainEqual(
+            expect.objectContaining({ title: 'Réponse initiale conservée' }),
+          );
+        });
+
+      expect(receivedCalls).toBe(2);
+      expect(receivedSystemPrompts[1]).toContain('repair an AI simulation response');
+    } finally {
+      await new Promise<void>((resolve) => provider.close(() => resolve()));
     }
   });
 
@@ -557,7 +1911,17 @@ describe('API v1', () => {
       expect(receivedSystemPrompts[0]).toContain('Réponds exclusivement en français.');
       expect(receivedSystemPrompts[0]).toContain('titres, descriptions et raisons');
       expect(receivedSystemPrompts[1]).toContain('repair an AI simulation response');
-      expect(receivedResponseFormats).toEqual([{ type: 'json_object' }, { type: 'json_object' }]);
+      expect(receivedResponseFormats).toHaveLength(2);
+      expect(receivedResponseFormats).toEqual([
+        expect.objectContaining({
+          type: 'json_schema',
+          json_schema: expect.objectContaining({ name: 'generated_turn', strict: true }),
+        }),
+        expect.objectContaining({
+          type: 'json_schema',
+          json_schema: expect.objectContaining({ name: 'generated_turn', strict: true }),
+        }),
+      ]);
 
       const game = context.repository.getGame(created.body.id);
       expect(game.currentDate).toBe('1936-01-01');
@@ -805,6 +2169,18 @@ describe('API v1', () => {
           },
         ],
         helpers: [{ key: 'GAME_DATE', label: 'Date', source: 'game.date', format: 'text' }],
+        initialWorld: {
+          regions: [
+            {
+              regionId: 'Ile_de_France',
+              ownerNationCode: 'GER',
+              controllerNationCode: 'GER',
+              claimNationCodes: ['FRA'],
+              regionType: 'land',
+            },
+          ],
+          capitalRegionIds: {},
+        },
       })
       .expect(201);
     const published = await request(context.app)
@@ -823,6 +2199,31 @@ describe('API v1', () => {
       presetId: preset.body.id,
       currentDate: '1870-01-01',
       difficulty: 'hard',
+    });
+    const launchedRegions = await request(context.app)
+      .get(`/api/v1/games/${launched.body.id}/world/regions`)
+      .expect(200);
+    expect(
+      launchedRegions.body.find(
+        (region: { regionId: string }) => region.regionId === 'Ile_de_France',
+      ),
+    ).toMatchObject({
+      ownerNationCode: 'GER',
+      controllerNationCode: 'GER',
+      claimNationCodes: ['FRA'],
+    });
+    await request(context.app)
+      .patch(`/api/v1/games/${launched.body.id}/world/regions/Ile_de_France`)
+      .send({ ownerNationCode: 'FRA', controllerNationCode: 'FRA', claimNationCodes: [] })
+      .expect(200);
+    const unchangedPreset = await request(context.app)
+      .get(`/api/v1/presets/${preset.body.id}`)
+      .expect(200);
+    expect(unchangedPreset.body.initialWorld.regions[0]).toMatchObject({
+      regionId: 'Ile_de_France',
+      ownerNationCode: 'GER',
+      controllerNationCode: 'GER',
+      claimNationCodes: ['FRA'],
     });
   });
 });

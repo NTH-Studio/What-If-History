@@ -1,84 +1,79 @@
 import { describe, expect, it } from 'vitest';
-import {
-  createActionInputSchema,
-  createGameInputSchema,
-  eventMapCueSchema,
-  promulgateLawInputSchema,
-} from './index.js';
+import { createActionInputSchema, worldEffectSchema } from './index.js';
 
-describe('createGameInputSchema scenarios', () => {
-  const base = { nationCode: 'FRA', startDate: '1936-01-01' };
+const id = '10000000-0000-4000-8000-000000000001';
 
-  it('keeps historical API clients backwards compatible', () => {
-    expect(createGameInputSchema.parse(base)).toEqual(base);
-    expect(
-      createGameInputSchema.parse({ ...base, scenario: { mode: 'historical' } }).scenario,
-    ).toEqual({ mode: 'historical' });
+describe('WorldEffect contract', () => {
+  it.each([
+    { kind: 'territory', operation: 'cede', regionId: 'Ile_de_France', nationCode: 'GER' },
+    { kind: 'territory', operation: 'annex', regionId: 'Alsace', nationCode: 'GER' },
+    { kind: 'territory', operation: 'occupy', regionId: 'Alsace', nationCode: 'GER' },
+    { kind: 'territory', operation: 'liberate', regionId: 'Alsace', nationCode: 'FRA' },
+    { kind: 'territory', operation: 'add_claim', regionId: 'Alsace', nationCode: 'GER' },
+    { kind: 'territory', operation: 'remove_claim', regionId: 'Alsace', nationCode: 'GER' },
+    {
+      kind: 'unit',
+      operation: 'create',
+      name: '1re division',
+      unitType: 'infantry',
+      nationCode: 'FRA',
+      regionId: 'Ile_de_France',
+    },
+    { kind: 'unit', operation: 'move', unitId: id, regionId: 'Alsace' },
+    { kind: 'unit', operation: 'update', unitId: id, strength: 70 },
+    { kind: 'unit', operation: 'delete', unitId: id },
+    {
+      kind: 'feature',
+      operation: 'create',
+      name: 'Fort',
+      featureType: 'custom',
+      regionId: 'Alsace',
+      nationCode: 'FRA',
+    },
+    { kind: 'feature', operation: 'update', featureId: id, nationCode: 'GER' },
+    { kind: 'feature', operation: 'delete', featureId: id },
+    {
+      kind: 'law',
+      operation: 'enact',
+      nationCode: 'FRA',
+      title: 'Mobilisation',
+      summary: '',
+      category: 'military',
+    },
+    { kind: 'law', operation: 'repeal', nationCode: 'FRA', lawId: id },
+    { kind: 'capital', operation: 'set', nationCode: 'FRA', featureId: id },
+    {
+      kind: 'nation',
+      operation: 'adjust',
+      nationCode: 'FRA',
+      changes: { stability: -5, atWar: true, allies: ['GBR'] },
+    },
+  ])('accepts $kind/$operation', (effect) => {
+    expect(worldEffectSchema.safeParse(effect).success).toBe(true);
   });
 
-  it('trims and accepts a custom scenario premise', () => {
+  it('rejects malformed identifiers and oversized effect queues', () => {
     expect(
-      createGameInputSchema.parse({
-        ...base,
-        scenario: { mode: 'custom', premise: '  Une épidémie mondiale éclate.  ' },
-      }).scenario,
-    ).toEqual({ mode: 'custom', premise: 'Une épidémie mondiale éclate.' });
-  });
-
-  it('rejects empty and oversized custom scenario premises', () => {
-    expect(
-      createGameInputSchema.safeParse({
-        ...base,
-        scenario: { mode: 'custom', premise: '   ' },
+      worldEffectSchema.safeParse({
+        kind: 'unit',
+        operation: 'move',
+        unitId: 'not-a-uuid',
+        regionId: '',
       }).success,
     ).toBe(false);
+
     expect(
-      createGameInputSchema.safeParse({
-        ...base,
-        scenario: { mode: 'custom', premise: 'x'.repeat(4_001) },
+      createActionInputSchema.safeParse({
+        actionText: 'Ordre massif',
+        actionType: 'general',
+        effects: Array.from({ length: 101 }, () => ({
+          kind: 'territory',
+          operation: 'add_claim',
+          regionId: 'Alsace',
+          nationCode: 'GER',
+        })),
+        previewWorldRevision: 0,
       }).success,
     ).toBe(false);
-  });
-});
-
-describe('event map cues', () => {
-  it('accepts a precise primary region and bounded secondary coordinates', () => {
-    expect(
-      eventMapCueSchema.parse({
-        locations: [
-          { kind: 'region', role: 'primary', region_id: 'Ile_de_France' },
-          { kind: 'coordinates', role: 'secondary', coordinates: [706.2, 139.2] },
-        ],
-      }),
-    ).toEqual({
-      camera: 'auto',
-      locations: [
-        { kind: 'region', role: 'primary', region_id: 'Ile_de_France' },
-        { kind: 'coordinates', role: 'secondary', coordinates: [706.2, 139.2] },
-      ],
-    });
-  });
-
-  it('rejects coordinates outside the campaign map', () => {
-    expect(
-      eventMapCueSchema.safeParse({
-        locations: [{ kind: 'coordinates', coordinates: [1500, 700] }],
-      }).success,
-    ).toBe(false);
-  });
-});
-
-describe('law action schemas', () => {
-  it('accepts laws while keeping direct promulgation text bounded', () => {
-    expect(
-      createActionInputSchema.parse({
-        actionText: 'Créer un service de santé.',
-        actionType: 'law',
-      }),
-    ).toMatchObject({ actionType: 'law' });
-    expect(promulgateLawInputSchema.parse({ actionText: '  Fermer les frontières.  ' })).toEqual({
-      actionText: 'Fermer les frontières.',
-    });
-    expect(promulgateLawInputSchema.safeParse({ actionText: '   ' }).success).toBe(false);
   });
 });

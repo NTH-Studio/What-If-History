@@ -1,5 +1,8 @@
 import type {
   Action,
+  ActionPreview,
+  ActionPreviewInput,
+  AppliedMutation,
   AdvisorMessage,
   Chat,
   ChatMessage,
@@ -16,21 +19,29 @@ import type {
   GameSummary,
   GameRegion,
   GameSnapshot,
+  HistoricalWorldPreview,
   LlmSettingsInput,
   LlmSettingsPublic,
   LlmActivity,
   MapRegion,
   MapFeature,
+  MovementOrder,
+  MovementOrderInput,
+  MovementOrderPreview,
   Nation,
   ProblemDetails,
   Preset,
   PresetDetail,
   TimeJump,
+  TimelineEntry,
   TurnRun,
   TurnResult,
   UpdateGameConfigInput,
   UpdatePresetInput,
   Unit,
+  Character,
+  IntelContact,
+  StrategicState,
 } from '@what-if-history/contracts';
 
 const clientIdKey = 'what-if-history-client-id';
@@ -54,6 +65,8 @@ function createClientId() {
   const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
+
+export const createRequestId = () => createClientId();
 
 export function getClientId() {
   const existing = sessionStorage.getItem(clientIdKey);
@@ -94,6 +107,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   nations: () => request<Nation[]>('/catalog/nations'),
+  nationsAt: (date: string) =>
+    request<Nation[]>(`/catalog/nations?date=${encodeURIComponent(date)}`),
+  historicalWorld: (date: string) =>
+    request<HistoricalWorldPreview>(`/catalog/historical-world?date=${encodeURIComponent(date)}`),
   countries: (gameId: string) => request<CountrySummary[]>(`/games/${gameId}/countries`),
   country: (gameId: string, nationCode: string) =>
     request<CountryProfile>(`/games/${gameId}/countries/${encodeURIComponent(nationCode)}`),
@@ -121,18 +138,31 @@ export const api = {
   deleteGame: (id: string) => request<void>(`/games/${id}`, { method: 'DELETE' }),
   updateGameConfig: (id: string, input: UpdateGameConfigInput) =>
     request<Game>(`/games/${id}/config`, { method: 'PATCH', body: JSON.stringify(input) }),
-  advanceTurn: (id: string, jump: TimeJump) =>
+  advanceTurn: (id: string, jump: TimeJump, idempotencyKey?: string) =>
     request<TurnResult>(`/games/${id}/turns`, {
       method: 'POST',
       body: JSON.stringify(jump),
+      ...(idempotencyKey ? { headers: { 'x-idempotency-key': idempotencyKey } } : {}),
     }),
   actions: (id: string) => request<Action[]>(`/games/${id}/actions`),
+  previewAction: (id: string, input: ActionPreviewInput) =>
+    request<ActionPreview>(`/games/${id}/actions/preview`, {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
   createAction: (id: string, input: CreateActionInput) =>
     request<Action>(`/games/${id}/actions`, { method: 'POST', body: JSON.stringify(input) }),
-  promulgateLaw: (id: string, actionText: string) =>
+  promulgateLaw: (
+    id: string,
+    input: {
+      actionText: string;
+      effects?: ActionPreview['effects'];
+      previewWorldRevision?: number;
+    },
+  ) =>
     request<Action>(`/games/${id}/actions/promulgate-law`, {
       method: 'POST',
-      body: JSON.stringify({ actionText }),
+      body: JSON.stringify(input),
     }),
   brainstorm: (id: string) =>
     request<{ suggestions: string }>(`/games/${id}/actions/brainstorm`, { method: 'POST' }),
@@ -157,6 +187,24 @@ export const api = {
   deleteEvent: (gameId: string, eventId: string) =>
     request<void>(`/games/${gameId}/events/${eventId}`, { method: 'DELETE' }),
   units: (id: string) => request<Unit[]>(`/games/${id}/units`),
+  strategicState: (id: string, sinceRevision?: number) =>
+    request<StrategicState>(
+      `/games/${id}/strategic-state${sinceRevision === undefined ? '' : `?sinceRevision=${sinceRevision}`}`,
+    ),
+  characters: (id: string) => request<Character[]>(`/games/${id}/characters`),
+  contacts: (id: string) => request<IntelContact[]>(`/games/${id}/contacts`),
+  timeline: (id: string, limit = 300) =>
+    request<TimelineEntry[]>(`/games/${id}/timeline?limit=${limit}`),
+  previewOrder: (id: string, input: MovementOrderInput) =>
+    request<MovementOrderPreview>(`/games/${id}/orders/preview`, {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+  createOrder: (id: string, input: MovementOrderInput) =>
+    request<MovementOrder>(`/games/${id}/orders`, {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
   chats: (id: string) => request<Chat[]>(`/games/${id}/chats`),
   createChat: (id: string, targetNationCodes: string | string[]) =>
     request<Chat>(`/games/${id}/chats`, {
@@ -215,7 +263,12 @@ export const api = {
   updateGameRegion: (
     gameId: string,
     regionId: string,
-    input: Partial<Pick<GameRegion, 'ownerNationCode' | 'regionType'>>,
+    input: Partial<
+      Pick<
+        GameRegion,
+        'ownerNationCode' | 'controllerNationCode' | 'claimNationCodes' | 'regionType'
+      >
+    >,
   ) =>
     request<GameRegion>(`/games/${gameId}/world/regions/${encodeURIComponent(regionId)}`, {
       method: 'PATCH',
@@ -234,8 +287,7 @@ export const api = {
     }),
   deleteMapFeature: (gameId: string, id: string) =>
     request<void>(`/games/${gameId}/world/features/${id}`, { method: 'DELETE' }),
-  worldHistory: (id: string) =>
-    request<Array<Record<string, unknown>>>(`/games/${id}/world/history`),
+  worldHistory: (id: string) => request<AppliedMutation[]>(`/games/${id}/world/history`),
   presets: () => request<Preset[]>('/presets'),
   preset: (id: string) => request<PresetDetail>(`/presets/${id}`),
   createPreset: (input: CreatePresetInput) =>

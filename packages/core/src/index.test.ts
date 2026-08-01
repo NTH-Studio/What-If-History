@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import type { NationState } from '@what-if-history/contracts';
-import { addTime, applyEventChanges, applyNaturalEvolution, createStartingUnits } from './index.js';
+import type { NationState, RegionState } from '@what-if-history/contracts';
+import {
+  addTime,
+  applyEventChanges,
+  applyNaturalEvolution,
+  applyRegionalImpact,
+  createStartingUnits,
+  distributeRegionalPopulation,
+  findStrategicRoute,
+} from './index.js';
 
 describe('addTime', () => {
   it('advances a date deterministically in UTC', () => {
@@ -37,6 +45,8 @@ describe('applyEventChanges', () => {
       foodSecurity: 72,
       populationGrowthRate: 0.5,
       gdpGrowthRate: 2,
+      capitalFeatureId: null,
+      capitalStatus: 'established',
     };
 
     const result = applyEventChanges(new Map([['FRA', state]]), [
@@ -89,6 +99,8 @@ describe('applyNaturalEvolution', () => {
       foodSecurity: 75,
       populationGrowthRate: 1,
       gdpGrowthRate: 4,
+      capitalFeatureId: null,
+      capitalStatus: 'established',
     };
 
     const evolved = applyNaturalEvolution(new Map([['FRA', state]]), {
@@ -143,5 +155,131 @@ describe('createStartingUnits', () => {
         centroid: [680.4, 84.7],
       },
     ]);
+  });
+});
+
+describe('grand strategy simulation', () => {
+  const gameId = '00000000-0000-4000-8000-000000000000';
+  const timestamp = '2000-01-02T00:00:00.000Z';
+
+  it('preserves a national population exactly when distributing it across regions', () => {
+    const regions = distributeRegionalPopulation(
+      gameId,
+      [{ nationCode: 'ENG', population: 50_000_000, industrialCapacity: 80, health: 75 }],
+      [
+        {
+          regionId: 'Greater_London_Area',
+          nationCode: 'ENG',
+          terrain: 'urban',
+          neighbors: ['Home_Counties'],
+          cityWeight: 9,
+        },
+        {
+          regionId: 'Home_Counties',
+          nationCode: 'ENG',
+          terrain: 'plains',
+          neighbors: ['Greater_London_Area'],
+          cityWeight: 1,
+        },
+      ],
+      timestamp,
+    );
+
+    expect(regions.reduce((total, region) => total + region.population, 0)).toBe(50_000_000);
+    expect(regions[0]!.population).toBe(45_000_000);
+  });
+
+  it('preserves a legacy fractional national population exactly', () => {
+    const population = 42_250_809.71937029;
+    const regions = distributeRegionalPopulation(
+      gameId,
+      [{ nationCode: 'FRA', population, industrialCapacity: 82, health: 76 }],
+      [
+        {
+          regionId: 'Ile_de_France',
+          nationCode: 'FRA',
+          terrain: 'urban',
+          neighbors: ['Normandy'],
+          cityWeight: 8,
+        },
+        {
+          regionId: 'Normandy',
+          nationCode: 'FRA',
+          terrain: 'plains',
+          neighbors: ['Ile_de_France'],
+          cityWeight: 2,
+        },
+      ],
+      timestamp,
+    );
+
+    expect(regions.reduce((total, region) => total + region.population, 0)).toBe(population);
+  });
+
+  it('turns a populated nuclear target uninhabitable and removes population', () => {
+    const target: RegionState = {
+      gameId,
+      regionId: 'Greater_London_Area',
+      nationCode: 'ENG',
+      population: 10_000_000,
+      displacedPopulation: 0,
+      woundedPopulation: 0,
+      infrastructure: 100,
+      industrialCapacity: 100,
+      supply: 100,
+      health: 100,
+      habitability: 100,
+      contamination: 0,
+      radiation: 0,
+      terrain: 'urban',
+      neighbors: ['Home_Counties'],
+      updatedAt: timestamp,
+    };
+    const neighbor = { ...target, regionId: 'Home_Counties', population: 5_000_000, neighbors: [] };
+    const result = applyRegionalImpact(
+      [target, neighbor],
+      { kind: 'nuclear_strike', intensity: 100, targetRegionId: target.regionId },
+      timestamp,
+    );
+    const changed = result.regions.find((region) => region.regionId === target.regionId)!;
+
+    expect(result.deaths).toBeGreaterThan(5_000_000);
+    expect(changed.population + changed.displacedPopulation).toBeLessThan(target.population);
+    expect(changed.habitability).toBeLessThan(20);
+    expect(changed.radiation).toBe(100);
+    expect(result.affectedRegionIds).toContain('Home_Counties');
+  });
+
+  it('enforces land and naval route domains', () => {
+    const seed = (regionId: string, terrain: RegionState['terrain'], neighbors: string[]) => ({
+      gameId,
+      regionId,
+      nationCode: 'FRA',
+      population: 1,
+      displacedPopulation: 0,
+      woundedPopulation: 0,
+      infrastructure: 100,
+      industrialCapacity: 100,
+      supply: 100,
+      health: 100,
+      habitability: terrain === 'ocean' ? 0 : 100,
+      contamination: 0,
+      radiation: 0,
+      terrain,
+      neighbors,
+      updatedAt: timestamp,
+    });
+    const regions = [
+      seed('Paris', 'plains', ['Channel']),
+      seed('Channel', 'ocean', ['Paris', 'London']),
+      seed('London', 'coastal', ['Channel']),
+    ];
+
+    expect(findStrategicRoute(regions, 'Paris', 'London', 'land')).toBeNull();
+    expect(findStrategicRoute(regions, 'Channel', 'London', 'naval')).toEqual([
+      'Channel',
+      'London',
+    ]);
+    expect(findStrategicRoute(regions, 'Paris', 'London', 'air')).toEqual(['Paris', 'London']);
   });
 });

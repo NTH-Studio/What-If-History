@@ -115,24 +115,9 @@ p {
 }
 
 .brand-mark {
+  display: block;
   flex: 0 0 auto;
-  overflow: visible;
-}
-
-.brand-mark-ring {
-  stroke: var(--accent);
-}
-
-.brand-mark-map {
-  stroke: var(--atlas-blue);
-}
-
-.brand-mark-branch {
-  stroke: var(--seal);
-}
-
-.brand-mark-node {
-  fill: var(--accent);
+  object-fit: contain;
 }
 
 @media (prefers-reduced-motion: reduce) {

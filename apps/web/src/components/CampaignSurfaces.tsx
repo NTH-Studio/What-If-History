@@ -15,7 +15,7 @@ import {
 import { useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { TimeJump, TurnResult, TurnRun } from '@what-if-history/contracts';
-import { ApiError, api } from '../api';
+import { ApiError, api, createRequestId } from '../api';
 import styles from '../styles/App.module.css';
 
 export type TimeJumpDraft = Required<Pick<TimeJump, 'amount' | 'unit' | 'strategy'>>;
@@ -74,8 +74,9 @@ export function TimeAdvanceDialog({
   const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
   const submitting = useRef(false);
+  const idempotencyKey = useRef(createRequestId());
   const mutation = useMutation({
-    mutationFn: () => api.advanceTurn(gameId, jump),
+    mutationFn: () => api.advanceTurn(gameId, jump, idempotencyKey.current),
     onMutate: () => {
       submitting.current = true;
       onPendingChange(true);
@@ -88,10 +89,17 @@ export function TimeAdvanceDialog({
         queryClient.invalidateQueries({ queryKey: ['turn-runs', gameId] }),
         queryClient.invalidateQueries({ queryKey: ['snapshots', gameId] }),
         queryClient.invalidateQueries({ queryKey: ['consolidations', gameId] }),
+        queryClient.invalidateQueries({ queryKey: ['game-regions', gameId] }),
+        queryClient.invalidateQueries({ queryKey: ['map-features', gameId] }),
+        queryClient.invalidateQueries({ queryKey: ['units', gameId] }),
+        queryClient.invalidateQueries({ queryKey: ['countries', gameId] }),
+        queryClient.invalidateQueries({ queryKey: ['country', gameId] }),
+        queryClient.invalidateQueries({ queryKey: ['world-history', gameId] }),
       ]);
       onOpenChange(false);
       onMinimizedChange(false);
       onTurnCompleted(result);
+      idempotencyKey.current = createRequestId();
     },
     onSettled: () => {
       submitting.current = false;

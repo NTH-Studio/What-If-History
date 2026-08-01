@@ -1,4 +1,9 @@
-import type { LlmProviderName, LlmSettingsInput, LlmTokenUsage } from '@what-if-history/contracts';
+import type {
+  LlmProviderName,
+  LlmSettingsInput,
+  LlmTokenUsage,
+  StructuredOutputMode,
+} from '@what-if-history/contracts';
 import { AppError } from '../errors.js';
 
 export interface CompletionRequest {
@@ -7,6 +12,10 @@ export interface CompletionRequest {
   maxTokens?: number;
   temperature?: number;
   responseFormat?: 'json';
+  responseSchema?: {
+    name: string;
+    schema: unknown;
+  };
 }
 
 export interface LlmProvider {
@@ -24,6 +33,35 @@ export interface PrivateLlmSettings {
   apiUrl: string;
   apiKey: string;
   model: string;
+}
+
+export function assertLlmProviderAllowed(provider: LlmProviderName, allowFakeProvider: boolean) {
+  if (provider === 'fake' && !allowFakeProvider) {
+    throw new AppError(
+      409,
+      'FAKE_LLM_PROVIDER_DISABLED',
+      'The deterministic AI provider is restricted to isolated test servers. Configure a real AI provider.',
+    );
+  }
+}
+
+export function structuredOutputModeFor(
+  settings: Pick<PrivateLlmSettings, 'provider' | 'apiUrl' | 'model'>,
+): StructuredOutputMode {
+  if (
+    settings.provider === 'lm-studio' ||
+    settings.provider === 'openai' ||
+    settings.provider === 'google'
+  ) {
+    return 'native_json_schema';
+  }
+  if (settings.provider === 'ollama') {
+    return usesOllamaCloud(settings) ? 'server_validation' : 'native_json_schema';
+  }
+  if (settings.provider === 'llama.cpp' || settings.provider === 'vllm') {
+    return 'json_mode';
+  }
+  return 'server_validation';
 }
 
 async function requestJson(
@@ -63,6 +101,23 @@ function normalizeOpenAiBase(url: string) {
   return url.replace(/\/+$/, '').replace(/\/chat\/completions$/, '');
 }
 
+function normalizeOllamaChatUrl(url: string) {
+  const base = url.replace(/\/+$/, '');
+  if (base.endsWith('/api/chat')) return base;
+  if (base.endsWith('/api')) return `${base}/chat`;
+  return `${base}/api/chat`;
+}
+
+function usesOllamaCloud(settings: Pick<PrivateLlmSettings, 'apiUrl' | 'model'>) {
+  if (settings.model.toLowerCase().endsWith(':cloud')) return true;
+  try {
+    const hostname = new URL(settings.apiUrl).hostname.toLowerCase();
+    return hostname === 'ollama.com' || hostname.endsWith('.ollama.com');
+  } catch {
+    return false;
+  }
+}
+
 function tokenCount(value: unknown) {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : undefined;
 }
@@ -77,6 +132,33 @@ function usageFrom(input: unknown, output: unknown, total: unknown): LlmTokenUsa
     outputTokens,
     totalTokens: totalTokens ?? inputTokens + outputTokens,
   };
+}
+
+function structuredResponseFormat(
+  provider: LlmProviderName,
+  responseSchema?: CompletionRequest['responseSchema'],
+) {
+  if (provider === 'lm-studio' || provider === 'openai') {
+    if (responseSchema) {
+      return {
+        type: 'json_schema',
+        json_schema: {
+          name: responseSchema.name,
+          strict: true,
+          schema: responseSchema.schema,
+        },
+      };
+    }
+    return {
+      type: 'json_schema',
+      json_schema: {
+        name: 'structured_response',
+        strict: false,
+        schema: { type: 'object' },
+      },
+    };
+  }
+  return { type: 'json_object' };
 }
 
 class OpenAiCompatibleProvider implements LlmProvider {
@@ -109,23 +191,31 @@ class OpenAiCompatibleProvider implements LlmProvider {
           temperature: request.temperature ?? 0.7,
           max_tokens: request.maxTokens ?? 3_000,
           ...(request.responseFormat === 'json'
-            ? { response_format: { type: 'json_object' } }
+            ? {
+                response_format: structuredResponseFormat(
+                  this.settings.provider,
+                  request.responseSchema,
+                ),
+              }
             : {}),
         }),
       },
       this.timeoutMs,
     );
     const choices = result.choices;
-    const content =
+    const message =
       Array.isArray(choices) &&
       typeof choices[0] === 'object' &&
       choices[0] !== null &&
       'message' in choices[0] &&
       typeof choices[0].message === 'object' &&
-      choices[0].message !== null &&
-      'content' in choices[0].message
-        ? choices[0].message.content
+      choices[0].message !== null
+        ? (choices[0].message as Record<string, unknown>)
         : undefined;
+    const content =
+      typeof message?.content === 'string' && message.content.trim()
+        ? message.content
+        : message?.reasoning_content;
     if (typeof content !== 'string') {
       throw new AppError(502, 'LLM_INVALID_RESPONSE', 'The AI response contained no message.');
     }
@@ -137,6 +227,58 @@ class OpenAiCompatibleProvider implements LlmProvider {
             (result.usage as Record<string, unknown>).total_tokens,
           )
         : undefined;
+    return { text: content, ...(usage ? { usage } : {}) };
+  }
+}
+
+class OllamaProvider implements LlmProvider {
+  readonly name = 'ollama' as const;
+
+  constructor(
+    private readonly settings: PrivateLlmSettings,
+    private readonly timeoutMs: number,
+  ) {}
+
+  async complete(request: CompletionRequest): Promise<CompletionResult> {
+    const result = await requestJson(
+      normalizeOllamaChatUrl(this.settings.apiUrl),
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(this.settings.apiKey ? { authorization: `Bearer ${this.settings.apiKey}` } : {}),
+        },
+        body: JSON.stringify({
+          model: this.settings.model,
+          messages: [
+            { role: 'system', content: request.system },
+            { role: 'user', content: request.user },
+          ],
+          stream: false,
+          think: false,
+          options: {
+            temperature: request.temperature ?? 0.7,
+            num_predict: request.maxTokens ?? 3_000,
+          },
+          ...(request.responseFormat === 'json' && !usesOllamaCloud(this.settings)
+            ? { format: request.responseSchema?.schema ?? 'json' }
+            : {}),
+        }),
+      },
+      this.timeoutMs,
+    );
+    const message =
+      typeof result.message === 'object' && result.message !== null
+        ? (result.message as Record<string, unknown>)
+        : undefined;
+    const content =
+      typeof message?.content === 'string' && message.content.trim()
+        ? message.content
+        : message?.thinking;
+    if (typeof content !== 'string' || !content.trim()) {
+      throw new AppError(502, 'LLM_INVALID_RESPONSE', 'The Ollama response contained no message.');
+    }
+    const usage = usageFrom(result.prompt_eval_count, result.eval_count, undefined);
     return { text: content, ...(usage ? { usage } : {}) };
   }
 }
@@ -212,6 +354,14 @@ class GoogleProvider implements LlmProvider {
           generationConfig: {
             temperature: request.temperature ?? 0.7,
             maxOutputTokens: request.maxTokens ?? 3_000,
+            ...(request.responseFormat === 'json'
+              ? {
+                  responseMimeType: 'application/json',
+                  ...(request.responseSchema
+                    ? { responseJsonSchema: request.responseSchema.schema }
+                    : {}),
+                }
+              : {}),
           },
         }),
       },
@@ -279,10 +429,17 @@ class FakeProvider implements LlmProvider {
       };
     }
     if (request.user.includes('"accepted"')) {
+      const forcedRejection = request.user.includes('FORCE_REJECT_FOR_TEST');
       return {
         text: JSON.stringify({
-          accepted: true,
-          reason: french ? 'Ordre historiquement plausible.' : 'Historically plausible.',
+          accepted: !forcedRejection,
+          reason: forcedRejection
+            ? french
+              ? 'Avertissement de faisabilité simulé.'
+              : 'Simulated feasibility warning.'
+            : french
+              ? 'Ordre historiquement plausible.'
+              : 'Historically plausible.',
         }),
         usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
       };
@@ -298,6 +455,7 @@ class FakeProvider implements LlmProvider {
 
 export function createProvider(settings: PrivateLlmSettings, timeoutMs: number): LlmProvider {
   if (settings.provider === 'fake') return new FakeProvider();
+  if (settings.provider === 'ollama') return new OllamaProvider(settings, timeoutMs);
   if (settings.provider === 'anthropic') return new AnthropicProvider(settings, timeoutMs);
   if (settings.provider === 'google') return new GoogleProvider(settings, timeoutMs);
   return new OpenAiCompatibleProvider(settings, timeoutMs);
@@ -307,10 +465,11 @@ export function toPrivateSettings(
   input: LlmSettingsInput,
   existingApiKey = '',
 ): PrivateLlmSettings {
+  const submittedApiKey = input.apiKey?.trim() ? input.apiKey : undefined;
   return {
     provider: input.provider,
     apiUrl: input.apiUrl,
-    apiKey: input.clearApiKey ? '' : (input.apiKey ?? existingApiKey),
+    apiKey: input.clearApiKey ? '' : (submittedApiKey ?? existingApiKey),
     model: input.model,
   };
 }

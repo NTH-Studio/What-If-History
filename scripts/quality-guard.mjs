@@ -83,7 +83,6 @@ if (isGitRepository) {
   }
 }
 
-// eslint-disable-next-line no-irregular-whitespace
 const mojibake =
   /(?:\u00c3\u0192.|\u00c3\u201a.|\u00c3\u00e2\u201a\u00ac|\u00c3\u00e2\u20ac\u017e|\u00c3\u00e2\u0153|\u00c3\u00e2\u20ac\u00a0|\u00c3\u00e2\u20ac\u009d|\u00c3\u00e2\u20ac\u00a2|\u00c3\u00af\u00c2\u00b8|\u00c3\u00b0\u00c5\u00b8|\ufffd)/;
 const retiredTerms = [
@@ -102,6 +101,7 @@ const retiredTerms = [
 
 for (const relative of projectFiles) {
   const absolute = path.join(root, relative);
+  if (/\.(?:gif|ico|jpe?g|png|webp|woff2?)$/i.test(relative)) continue;
   if (fs.statSync(absolute).size > 5_000_000) continue;
   const content = fs.readFileSync(absolute, 'utf8');
   if (/^(?:apps|packages|data|README)/.test(relative) && mojibake.test(content)) {

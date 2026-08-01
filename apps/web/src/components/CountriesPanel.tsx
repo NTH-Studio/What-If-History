@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { CountryIndicators, CountryProfile, CountrySummary } from '@what-if-history/contracts';
-import { ArrowLeftRight, Landmark, MessageSquare, Scale, Search } from 'lucide-react';
+import { ArrowLeftRight, Landmark, MessageSquare, Scale, Search, X } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../api';
@@ -15,12 +15,14 @@ export function CountriesPanel({
   selectedCode,
   onSelect,
   onStartDiplomacy,
+  onClose,
 }: {
   gameId: string;
   playerNationCode: string;
   selectedCode: string | undefined;
   onSelect: (code: string) => void;
   onStartDiplomacy: () => void;
+  onClose: () => void;
 }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -77,15 +79,25 @@ export function CountriesPanel({
 
   return (
     <div className={styles.countriesPage}>
-      <header className={styles.workspaceHeader}>
+      <header className={`${styles.workspaceHeader} ${styles.surfaceHeader}`}>
         <div>
           <p className={styles.eyebrow}>{t('countries.eyebrow')}</p>
           <h1>{t('countries.title')}</h1>
           <p className={styles.muted}>{t('countries.description')}</p>
         </div>
-        <span className={styles.turnBadge}>
-          {t('countries.count', { count: countries.data?.length })}
-        </span>
+        <div className={styles.surfaceHeaderActions}>
+          <span className={styles.turnBadge}>
+            {t('countries.count', { count: countries.data?.length })}
+          </span>
+          <button
+            type="button"
+            className={styles.surfaceClose}
+            aria-label={t('common.close')}
+            onClick={onClose}
+          >
+            <X size={18} />
+          </button>
+        </div>
       </header>
 
       <div className={styles.countryFilters}>
@@ -221,6 +233,9 @@ function CountryProfileView({
             </button>
           ) : null}
           {profile.isMajorPower ? <span>{t('countries.majorPower')}</span> : null}
+          <span data-status={profile.capitalStatus}>
+            {t(`countries.capitalStatuses.${profile.capitalStatus}`)}
+          </span>
           {profile.indicators.atWar ? (
             <span className={styles.dangerBadge}>{t('countries.atWar')}</span>
           ) : null}
@@ -265,6 +280,18 @@ function CountryProfileView({
               <div>
                 <dt>{t('countries.units')}</dt>
                 <dd>{integer.format(profile.unitCount)}</dd>
+              </div>
+              <div>
+                <dt>{t('countries.ownedTerritories')}</dt>
+                <dd>{integer.format(profile.ownedRegionCount)}</dd>
+              </div>
+              <div>
+                <dt>{t('countries.controlledTerritories')}</dt>
+                <dd>{integer.format(profile.controlledRegionCount)}</dd>
+              </div>
+              <div>
+                <dt>{t('countries.claimedTerritories')}</dt>
+                <dd>{integer.format(profile.claimedRegionCount)}</dd>
               </div>
             </dl>
           </section>

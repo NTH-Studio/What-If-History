@@ -18,8 +18,11 @@ export default defineConfig({
       PORT: '3100',
       DATABASE_PATH: e2eDatabasePath,
       NODE_ENV: 'test',
-      GLOBAL_RATE_LIMIT_PER_MINUTE: '1000',
-      LLM_RATE_LIMIT_PER_MINUTE: '1000',
+      // The complete two-worker suite legitimately exceeds 1,000 API reads while exercising
+      // map refreshes. Keep rate-limit behavior covered by server tests instead of throttling
+      // the isolated browser database and turning later UI assertions into unrelated 429s.
+      GLOBAL_RATE_LIMIT_PER_MINUTE: '100000',
+      LLM_RATE_LIMIT_PER_MINUTE: '100000',
     },
   },
   projects: [

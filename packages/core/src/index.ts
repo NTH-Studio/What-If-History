@@ -1,5 +1,7 @@
 import type { GeneratedEvent, NationState, TimeJump, Unit } from '@what-if-history/contracts';
 
+export * from './strategic.js';
+
 export const SIMULATION_END_DATE = '9999-12-31';
 
 export function addTime(currentDate: string, jump: TimeJump): string {

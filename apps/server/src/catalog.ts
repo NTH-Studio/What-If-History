@@ -183,7 +183,7 @@ export class Catalog {
   readonly regionMetadata: unknown;
   private readonly frenchNames: z.infer<typeof geographyNamesSchema>;
 
-  constructor(dataDirectory: string) {
+  constructor(readonly dataDirectory: string) {
     const rawNations = z
       .record(z.string(), nationSchema)
       .parse(readJson(path.join(dataDirectory, 'nations_v2.json')));

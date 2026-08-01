@@ -19,29 +19,35 @@ import { LlmService } from './llm/service.js';
 import { createApiRouter } from './routes.js';
 import { SseHub } from './sse.js';
 import { TurnService } from './turn-service.js';
+import { ActionEffectResolver } from './action-resolver.js';
+import { StrategicRepository } from './db/strategic-repository.js';
 
 interface CreateAppOptions {
   database?: DatabaseSync;
   databasePath?: string;
   dataDirectory?: string;
   webDirectory?: string;
+  environment?: typeof config.environment;
 }
 
 export function createApp(options: CreateAppOptions = {}) {
   const dataDirectory = options.dataDirectory ?? config.dataDirectory;
   const webDirectory = options.webDirectory ?? config.webDirectory;
   const database = options.database ?? openDatabase(options.databasePath ?? config.databasePath);
+  const environment = options.environment ?? config.environment;
   const catalog = new Catalog(dataDirectory);
   const repository = new Repository(database, catalog);
   const advanced = new AdvancedRepository(database, catalog);
+  const strategic = new StrategicRepository(database, catalog);
+  const actionEffects = new ActionEffectResolver(catalog, advanced);
   importLegacySettings(repository, dataDirectory);
   const logger = pino({ level: config.logLevel });
   const stream = new SseHub();
   const llmActivityStream = new LlmActivityHub();
   const llmActivity = new LlmActivityTracker(repository, llmActivityStream, logger);
   llmActivity.recoverInterruptedCalls();
-  const llm = new LlmService(repository, advanced, config.llmTimeoutMs);
-  const turns = new TurnService(repository, advanced, llm, stream, llmActivity);
+  const llm = new LlmService(repository, advanced, config.llmTimeoutMs, environment === 'test');
+  const turns = new TurnService(repository, advanced, strategic, llm, stream, llmActivity);
 
   const app = express();
   app.locals.logger = logger;
@@ -64,6 +70,10 @@ export function createApp(options: CreateAppOptions = {}) {
         'request completed',
       );
     });
+    next();
+  });
+  app.use((_req, res, next) => {
+    res.setHeader('Permissions-Policy', 'camera=(), geolocation=(), microphone=()');
     next();
   });
   app.use(
@@ -121,12 +131,15 @@ export function createApp(options: CreateAppOptions = {}) {
       catalog,
       repository,
       advanced,
+      strategic,
+      actionEffects,
       llm,
       turns,
       stream,
       llmActivity,
       llmActivityStream,
       llmRateLimitPerMinute: config.llmRateLimitPerMinute,
+      allowFakeLlmProvider: environment === 'test',
     }),
   );
   app.use('/api', (_req, _res, next) => {
@@ -141,5 +154,5 @@ export function createApp(options: CreateAppOptions = {}) {
   }
 
   app.use(errorMiddleware);
-  return { app, database, repository, advanced, catalog, llmActivity };
+  return { app, database, repository, advanced, strategic, catalog, llmActivity };
 }

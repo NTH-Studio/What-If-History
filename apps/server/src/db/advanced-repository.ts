@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync, SQLInputValue, StatementResultingChanges } from 'node:sqlite';
 import type {
+  Action,
+  AppliedMutation,
   AdvisorMessage,
   Consolidation,
   ConsolidationSettings,
@@ -13,43 +15,21 @@ import type {
   GeneratedMapFeatureChange,
   GeneratedUnitChange,
   MapFeature,
+  NationState,
   Preset,
   PresetDetail,
-  PresetHelper,
-  PresetPrompt,
+  PresetInitialWorld,
   RegionChange,
   TimeJump,
+  TurnResult,
   UpdateMapFeatureInput,
   UpdatePresetInput,
+  WorldEffect,
 } from '@what-if-history/contracts';
 import { AppError, notFound } from '../errors.js';
 import type { Catalog } from '../catalog.js';
-
-type Row = Record<string, unknown>;
-const now = () => new Date().toISOString();
-const text = (value: unknown) => String(value ?? '');
-const number = (value: unknown) => Number(value ?? 0);
-const nullableText = (value: unknown) =>
-  value === null || value === undefined ? null : text(value);
-const sqlValue = (value: unknown): SQLInputValue => {
-  if (
-    value === null ||
-    typeof value === 'string' ||
-    typeof value === 'number' ||
-    typeof value === 'bigint' ||
-    value instanceof Uint8Array
-  ) {
-    return value;
-  }
-  return text(value);
-};
-const parseJson = <T>(value: unknown, fallback: T): T => {
-  try {
-    return JSON.parse(text(value)) as T;
-  } catch {
-    return fallback;
-  }
-};
+import { PresetRepository } from './preset-repository.js';
+import { now, nullableText, number, parseJson, sqlValue, text, type Row } from './values.js';
 
 interface SnapshotPayload {
   game: Row;
@@ -62,13 +42,37 @@ interface SnapshotPayload {
   features: Row[];
   consolidations: Row[];
   mutations: Row[];
+  regionStates?: Row[];
+  impactZones?: Row[];
+  characters?: Row[];
+  orders?: Row[];
+  wars?: Row[];
+  fronts?: Row[];
+  contacts?: Row[];
+  arsenals?: Row[];
+  timeline?: Row[];
+  polities?: Row[];
+  officeHolders?: Row[];
+  historicalContinuity?: Row[];
+  historicalTransitions?: Row[];
+}
+
+interface MutationContext {
+  source: AppliedMutation['source'];
+  sourceActionId?: string;
+  sourceEventId?: string;
+  effect?: WorldEffect;
 }
 
 export class AdvancedRepository {
+  private readonly presets: PresetRepository;
+
   constructor(
     readonly database: DatabaseSync,
     private readonly catalog: Catalog,
-  ) {}
+  ) {
+    this.presets = new PresetRepository(database, catalog);
+  }
 
   listAdvisorMessages(gameId: string): AdvisorMessage[] {
     this.assertGame(gameId);
@@ -126,16 +130,74 @@ export class AdvancedRepository {
     this.database.prepare('DELETE FROM advisor_messages WHERE game_id = ?').run(gameId);
   }
 
-  startTurnRun(gameId: string, turnNumber: number, jump: TimeJump) {
+  findCompletedTurnResult(gameId: string, idempotencyKey: string): TurnResult | null {
+    const row = this.database
+      .prepare(
+        `SELECT result_json FROM turn_runs
+         WHERE game_id = ? AND idempotency_key = ? AND status = 'completed'`,
+      )
+      .get(gameId, idempotencyKey) as Row | undefined;
+    return row?.result_json ? parseJson<TurnResult>(row.result_json, null as never) : null;
+  }
+
+  startTurnRun(gameId: string, turnNumber: number, jump: TimeJump, idempotencyKey: string) {
+    const existing = this.database
+      .prepare('SELECT id FROM turn_runs WHERE game_id = ? AND idempotency_key = ?')
+      .get(gameId, idempotencyKey) as Row | undefined;
+    if (existing) {
+      const id = text(existing.id);
+      this.database
+        .prepare(
+          `UPDATE turn_runs SET turn_number = ?, strategy = ?, jump_payload = ?,
+           status = 'preparing', snapshot_id = NULL, error_code = NULL, completed_at = NULL,
+           generated_payload = NULL, schema_mode = NULL, repair_attempts = 0,
+           mutation_count = 0, result_json = NULL, started_at = ?
+           WHERE id = ?`,
+        )
+        .run(turnNumber, jump.strategy ?? 'fixed', JSON.stringify(jump), now(), id);
+      return id;
+    }
     const id = randomUUID();
     this.database
       .prepare(
         `INSERT INTO turn_runs (
-          id, game_id, turn_number, strategy, jump_payload, status, started_at
-        ) VALUES (?, ?, ?, ?, ?, 'preparing', ?)`,
+          id, game_id, turn_number, strategy, jump_payload, status, idempotency_key, started_at
+        ) VALUES (?, ?, ?, ?, ?, 'preparing', ?, ?)`,
       )
-      .run(id, gameId, turnNumber, jump.strategy ?? 'fixed', JSON.stringify(jump), now());
+      .run(
+        id,
+        gameId,
+        turnNumber,
+        jump.strategy ?? 'fixed',
+        JSON.stringify(jump),
+        idempotencyKey,
+        now(),
+      );
     return id;
+  }
+
+  completeTurnRunInTransaction(
+    id: string,
+    result: TurnResult,
+    generatedPayload: unknown,
+    schemaMode: string,
+    repairAttempts: number,
+  ) {
+    this.database
+      .prepare(
+        `UPDATE turn_runs SET status = 'completed', generated_payload = ?, schema_mode = ?,
+         repair_attempts = ?, mutation_count = ?, result_json = ?, completed_at = ?
+         WHERE id = ?`,
+      )
+      .run(
+        JSON.stringify(generatedPayload),
+        schemaMode,
+        repairAttempts,
+        result.appliedMutations.length,
+        JSON.stringify(result),
+        now(),
+        id,
+      );
   }
 
   updateTurnRun(
@@ -187,6 +249,19 @@ export class AdvancedRepository {
       features: this.rows('map_features', gameId),
       consolidations: this.rows('consolidations', gameId),
       mutations: this.rows('world_mutations', gameId),
+      regionStates: this.rows('region_states', gameId),
+      impactZones: this.rows('impact_zones', gameId),
+      characters: this.rows('characters', gameId),
+      orders: this.rows('strategic_orders', gameId),
+      wars: this.rows('wars', gameId),
+      fronts: this.rows('fronts', gameId),
+      contacts: this.rows('intel_contacts', gameId),
+      arsenals: this.rows('strategic_arsenals', gameId),
+      timeline: this.rows('timeline_entries', gameId),
+      polities: this.rows('game_polities', gameId),
+      officeHolders: this.rows('game_office_holders', gameId),
+      historicalContinuity: this.rows('historical_continuity', gameId),
+      historicalTransitions: this.rows('historical_transition_runs', gameId),
     };
     const snapshot: GameSnapshot = {
       id: randomUUID(),
@@ -243,6 +318,19 @@ export class AdvancedRepository {
       throw new AppError(422, 'INVALID_SNAPSHOT', 'The snapshot payload is invalid.');
     }
     const deleteTables = [
+      ['timeline_entries', payload.timeline ?? []],
+      ['historical_transition_runs', payload.historicalTransitions ?? []],
+      ['historical_continuity', payload.historicalContinuity ?? []],
+      ['game_office_holders', payload.officeHolders ?? []],
+      ['game_polities', payload.polities ?? []],
+      ['intel_contacts', payload.contacts ?? []],
+      ['fronts', payload.fronts ?? []],
+      ['wars', payload.wars ?? []],
+      ['strategic_orders', payload.orders ?? []],
+      ['impact_zones', payload.impactZones ?? []],
+      ['characters', payload.characters ?? []],
+      ['region_states', payload.regionStates ?? []],
+      ['strategic_arsenals', payload.arsenals ?? []],
       ['events', payload.events],
       ['country_laws', payload.laws],
       ['actions', payload.actions],
@@ -255,6 +343,10 @@ export class AdvancedRepository {
     ] as const;
     const insertTables: Array<[string, Row[]]> = [
       ['nation_states', payload.nationStates],
+      ['game_polities', payload.polities ?? []],
+      ['game_office_holders', payload.officeHolders ?? []],
+      ['historical_continuity', payload.historicalContinuity ?? []],
+      ['historical_transition_runs', payload.historicalTransitions ?? []],
       ['actions', payload.actions],
       ['country_laws', payload.laws],
       ['events', payload.events],
@@ -263,6 +355,15 @@ export class AdvancedRepository {
       ['map_features', payload.features],
       ['consolidations', payload.consolidations],
       ['world_mutations', payload.mutations],
+      ['region_states', payload.regionStates ?? []],
+      ['impact_zones', payload.impactZones ?? []],
+      ['characters', payload.characters ?? []],
+      ['strategic_orders', payload.orders ?? []],
+      ['wars', payload.wars ?? []],
+      ['fronts', payload.fronts ?? []],
+      ['intel_contacts', payload.contacts ?? []],
+      ['strategic_arsenals', payload.arsenals ?? []],
+      ['timeline_entries', payload.timeline ?? []],
     ];
     this.database.exec('BEGIN IMMEDIATE');
     try {
@@ -272,8 +373,29 @@ export class AdvancedRepository {
       for (const [table, rows] of insertTables) this.insertRows(table, rows);
       this.database
         .prepare(
+          `UPDATE game_regions SET controller_nation_code = owner_nation_code
+           WHERE game_id = ? AND controller_nation_code IS NULL`,
+        )
+        .run(gameId);
+      this.database
+        .prepare(
+          `UPDATE nation_states
+           SET capital_feature_id = (
+             SELECT map_features.id FROM map_features
+             WHERE map_features.game_id = nation_states.game_id
+               AND map_features.nation_code = nation_states.nation_code
+               AND map_features.feature_type = 'capital'
+             ORDER BY map_features.created_at
+             LIMIT 1
+           )
+           WHERE game_id = ? AND capital_feature_id IS NULL`,
+        )
+        .run(gameId);
+      this.database
+        .prepare(
           `UPDATE games SET current_date = ?, turn_number = ?, world_context = ?,
-           simulation_rules = ?, difficulty = ?, ai_models = ?, updated_at = ? WHERE id = ?`,
+           simulation_rules = ?, difficulty = ?, ai_models = ?,
+           world_revision = world_revision + 1, updated_at = ? WHERE id = ?`,
         )
         .run(
           sqlValue(payload.game.current_date),
@@ -285,6 +407,13 @@ export class AdvancedRepository {
           now(),
           gameId,
         );
+      this.database
+        .prepare(
+          `UPDATE actions SET preview_world_revision = (
+             SELECT world_revision FROM games WHERE id = ?
+           ) WHERE game_id = ? AND status = 'pending' AND effects_json != '[]'`,
+        )
+        .run(gameId, gameId);
       this.database.exec('COMMIT');
     } catch (error) {
       this.database.exec('ROLLBACK');
@@ -446,6 +575,10 @@ export class AdvancedRepository {
       regionId: text(row.region_id),
       name: text(row.name),
       ownerNationCode: nullableText(row.owner_nation_code),
+      controllerNationCode: nullableText(row.controller_nation_code),
+      claimNationCodes: parseJson<string[]>(row.claim_nation_codes, []),
+      territorialStatus: nullableText(row.territorial_status) as GameRegion['territorialStatus'],
+      administeringNationCode: nullableText(row.administering_nation_code),
       regionType: text(row.region_type) as GameRegion['regionType'],
       updatedAt: text(row.updated_at),
     }));
@@ -454,27 +587,64 @@ export class AdvancedRepository {
   updateRegion(
     gameId: string,
     regionId: string,
-    input: { ownerNationCode?: string | null; regionType?: GameRegion['regionType'] },
+    input: {
+      ownerNationCode?: string | null;
+      controllerNationCode?: string | null;
+      claimNationCodes?: string[];
+      regionType?: GameRegion['regionType'];
+    },
     turnNumber?: number,
+    context: MutationContext = { source: turnNumber === undefined ? 'manual' : 'simulation' },
   ) {
     const existing = this.database
       .prepare('SELECT * FROM game_regions WHERE game_id = ? AND region_id = ?')
       .get(gameId, regionId) as Row | undefined;
     if (!existing) throw notFound('Region');
-    if (input.ownerNationCode && !this.catalog.nations.has(input.ownerNationCode)) {
+    if (input.ownerNationCode && !this.nationExistsForGame(gameId, input.ownerNationCode)) {
       throw new AppError(400, 'UNKNOWN_NATION', 'The region owner does not exist.');
+    }
+    if (
+      input.controllerNationCode &&
+      !this.nationExistsForGame(gameId, input.controllerNationCode)
+    ) {
+      throw new AppError(400, 'UNKNOWN_NATION', 'The region controller does not exist.');
+    }
+    for (const claim of input.claimNationCodes ?? []) {
+      if (!this.nationExistsForGame(gameId, claim)) {
+        throw new AppError(400, 'UNKNOWN_NATION', 'A region claimant does not exist.');
+      }
     }
     const owner =
       input.ownerNationCode === undefined
         ? nullableText(existing.owner_nation_code)
         : input.ownerNationCode;
+    const controller =
+      input.controllerNationCode === undefined
+        ? nullableText(existing.controller_nation_code)
+        : input.controllerNationCode;
+    const claims =
+      input.claimNationCodes === undefined
+        ? parseJson<string[]>(existing.claim_nation_codes, [])
+        : [...new Set(input.claimNationCodes)];
     const regionType = input.regionType ?? (text(existing.region_type) as GameRegion['regionType']);
     this.database
       .prepare(
-        `UPDATE game_regions SET owner_nation_code = ?, region_type = ?, updated_at = ?
+        `UPDATE game_regions SET owner_nation_code = ?, controller_nation_code = ?,
+         claim_nation_codes = ?, region_type = ?, updated_at = ?
          WHERE game_id = ? AND region_id = ?`,
       )
-      .run(owner, regionType, now(), gameId, regionId);
+      .run(owner, controller, JSON.stringify(claims), regionType, now(), gameId, regionId);
+    if (
+      owner !== nullableText(existing.owner_nation_code) ||
+      controller !== nullableText(existing.controller_nation_code)
+    ) {
+      this.markHistoricalDivergence(
+        gameId,
+        'region',
+        regionId,
+        `Territorial state changed by ${context.source}.`,
+      );
+    }
     this.recordMutation(
       gameId,
       turnNumber ?? this.currentTurn(gameId),
@@ -484,9 +654,13 @@ export class AdvancedRepository {
       {
         ...existing,
         owner_nation_code: owner,
+        controller_nation_code: controller,
+        claim_nation_codes: JSON.stringify(claims),
         region_type: regionType,
       },
+      context,
     );
+    if (turnNumber === undefined) this.bumpWorldRevision(gameId);
     return this.listRegions(gameId).find((region) => region.regionId === regionId)!;
   }
 
@@ -499,7 +673,12 @@ export class AdvancedRepository {
     ).map(this.mapFeature);
   }
 
-  createMapFeature(gameId: string, input: CreateMapFeatureInput, turnNumber?: number): MapFeature {
+  createMapFeature(
+    gameId: string,
+    input: CreateMapFeatureInput,
+    turnNumber?: number,
+    context: MutationContext = { source: turnNumber === undefined ? 'manual' : 'simulation' },
+  ): MapFeature {
     this.assertRegion(gameId, input.regionId);
     if (input.nationCode && !this.catalog.nations.has(input.nationCode)) {
       throw new AppError(400, 'UNKNOWN_NATION', 'The feature nation does not exist.');
@@ -546,7 +725,9 @@ export class AdvancedRepository {
       feature.id,
       null,
       feature,
+      context,
     );
+    if (turnNumber === undefined) this.bumpWorldRevision(gameId);
     return feature;
   }
 
@@ -555,6 +736,7 @@ export class AdvancedRepository {
     id: string,
     input: UpdateMapFeatureInput,
     turnNumber?: number,
+    context: MutationContext = { source: turnNumber === undefined ? 'manual' : 'simulation' },
   ): MapFeature {
     const row = this.database
       .prepare('SELECT * FROM map_features WHERE id = ? AND game_id = ?')
@@ -593,11 +775,18 @@ export class AdvancedRepository {
       id,
       row,
       updated,
+      context,
     );
+    if (turnNumber === undefined) this.bumpWorldRevision(gameId);
     return updated;
   }
 
-  deleteMapFeature(gameId: string, id: string, turnNumber?: number) {
+  deleteMapFeature(
+    gameId: string,
+    id: string,
+    turnNumber?: number,
+    context: MutationContext = { source: turnNumber === undefined ? 'manual' : 'simulation' },
+  ) {
     const existing = this.database
       .prepare('SELECT * FROM map_features WHERE id = ? AND game_id = ?')
       .get(id, gameId) as Row | undefined;
@@ -615,7 +804,9 @@ export class AdvancedRepository {
       id,
       existing,
       null,
+      context,
     );
+    if (turnNumber === undefined) this.bumpWorldRevision(gameId);
   }
 
   applyWorldChanges(
@@ -624,7 +815,12 @@ export class AdvancedRepository {
     regionChanges: RegionChange[],
     unitChanges: GeneratedUnitChange[],
     featureChanges: GeneratedMapFeatureChange[],
+    sourceEventId?: string,
   ) {
+    const simulationContext: MutationContext = {
+      source: 'simulation',
+      ...(sourceEventId ? { sourceEventId } : {}),
+    };
     for (const change of regionChanges) {
       this.updateRegion(
         gameId,
@@ -633,281 +829,490 @@ export class AdvancedRepository {
           ...(change.owner_nation_code !== undefined
             ? { ownerNationCode: change.owner_nation_code }
             : {}),
+          ...(change.controller_nation_code !== undefined
+            ? { controllerNationCode: change.controller_nation_code }
+            : {}),
+          ...(change.claim_nation_codes !== undefined
+            ? { claimNationCodes: change.claim_nation_codes }
+            : {}),
           ...(change.region_type ? { regionType: change.region_type } : {}),
         },
         turnNumber,
+        simulationContext,
       );
     }
-    for (const change of unitChanges) this.applyUnitChange(gameId, turnNumber, change);
-    for (const change of featureChanges) this.applyFeatureChange(gameId, turnNumber, change);
+    for (const change of unitChanges) {
+      this.applyUnitChange(gameId, turnNumber, change, simulationContext);
+    }
+    for (const change of featureChanges) {
+      this.applyFeatureChange(gameId, turnNumber, change, simulationContext);
+    }
   }
 
-  listWorldMutations(gameId: string) {
+  validateQueuedActionRevisions(gameId: string, actions: Action[]) {
+    const currentRevision = this.currentWorldRevision(gameId);
+    const stale = actions.find(
+      (action) =>
+        action.effects.length > 0 &&
+        action.previewWorldRevision !== null &&
+        action.previewWorldRevision !== currentRevision,
+    );
+    if (stale) {
+      throw new AppError(
+        409,
+        'WORLD_REVISION_CONFLICT',
+        'A queued action was previewed against an older world revision.',
+        [{ path: `actions.${stale.id}`, message: 'Preview the action effects again.' }],
+      );
+    }
+  }
+
+  applyActionEffects(gameId: string, turnNumber: number, actions: Action[]) {
+    for (const action of actions) {
+      for (const effect of action.effects) {
+        this.applyWorldEffect(gameId, turnNumber, effect, {
+          source: 'player_action',
+          sourceActionId: action.id,
+          effect,
+        });
+      }
+    }
+  }
+
+  recordNationStateChanges(
+    gameId: string,
+    turnNumber: number,
+    beforeStates: NationState[],
+    afterStates: Map<string, NationState>,
+    events: GameEvent[],
+  ) {
+    const beforeByNation = new Map(beforeStates.map((state) => [state.nationCode, state]));
+    for (const event of events) {
+      for (const nationCode of Object.keys(event.state_changes)) {
+        const before = beforeByNation.get(nationCode);
+        const after = afterStates.get(nationCode);
+        if (!before || !after || JSON.stringify(before) === JSON.stringify(after)) continue;
+        this.recordMutation(gameId, turnNumber, 'nation', nationCode, before, after, {
+          source: 'simulation',
+          sourceEventId: event.id,
+        });
+        beforeByNation.set(nationCode, after);
+      }
+    }
+  }
+
+  listWorldMutations(gameId: string): AppliedMutation[] {
     this.assertGame(gameId);
-    return this.database
-      .prepare(
-        `SELECT id, turn_number, mutation_type, target_id, before_value, after_value, created_at
+    return (
+      this.database
+        .prepare(
+          `SELECT id, turn_number, mutation_source, source_action_id, source_event_id, mutation_type, target_id,
+                before_value, after_value, world_revision, created_at
          FROM world_mutations WHERE game_id = ? ORDER BY turn_number DESC, created_at DESC`,
-      )
-      .all(gameId);
+        )
+        .all(gameId) as Row[]
+    ).map((row) => ({
+      id: text(row.id),
+      turnNumber: number(row.turn_number),
+      source: text(row.mutation_source || 'simulation') as AppliedMutation['source'],
+      sourceActionId: nullableText(row.source_action_id),
+      sourceEventId: nullableText(row.source_event_id),
+      mutationType: text(row.mutation_type) as AppliedMutation['mutationType'],
+      targetId: text(row.target_id),
+      beforeValue: row.before_value === null ? null : parseJson(row.before_value, null),
+      afterValue: row.after_value === null ? null : parseJson(row.after_value, null),
+      worldRevision: number(row.world_revision),
+      createdAt: text(row.created_at),
+    }));
   }
 
   listPresets(): Preset[] {
-    return (
-      this.database
-        .prepare("SELECT * FROM presets WHERE status != 'archived' ORDER BY updated_at DESC")
-        .all() as Row[]
-    ).map(this.mapPreset);
+    return this.presets.listPresets();
   }
 
   getPreset(id: string): PresetDetail {
-    const row = this.database.prepare('SELECT * FROM presets WHERE id = ?').get(id) as
-      Row | undefined;
-    if (!row) throw notFound('Preset');
-    return {
-      ...this.mapPreset(row),
-      aiModels: {
-        actions: null,
-        advisor: null,
-        diplomacy: null,
-        turns: null,
-        ...parseJson(row.ai_models, {}),
-      },
-      prompts: (
-        this.database
-          .prepare('SELECT * FROM preset_prompts WHERE preset_id = ? ORDER BY mechanic')
-          .all(id) as Row[]
-      ).map((prompt) => ({
-        mechanic: text(prompt.mechanic) as PresetPrompt['mechanic'],
-        mode: text(prompt.mode) as PresetPrompt['mode'],
-        template: text(prompt.template),
-      })),
-      helpers: (
-        this.database
-          .prepare('SELECT * FROM preset_helpers WHERE preset_id = ? ORDER BY helper_key')
-          .all(id) as Row[]
-      ).map((helper) => ({
-        key: text(helper.helper_key),
-        label: text(helper.label),
-        source: text(helper.source) as PresetHelper['source'],
-        format: text(helper.format) as PresetHelper['format'],
-      })),
-    };
+    return this.presets.getPreset(id);
   }
 
   createPreset(input: CreatePresetInput): PresetDetail {
-    const timestamp = now();
-    const id = randomUUID();
-    const normalized = this.normalizePresetInput(input);
-    this.database.exec('BEGIN IMMEDIATE');
-    try {
-      this.database
-        .prepare(
-          `INSERT INTO presets (
-            id, title, summary, category, tags, start_date, world_context, simulation_rules,
-            recommended_difficulty, playable_nation_codes, ai_models, status, current_version,
-            created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', 0, ?, ?)`,
-        )
-        .run(
-          id,
-          normalized.title,
-          normalized.summary,
-          normalized.category,
-          JSON.stringify(normalized.tags),
-          normalized.startDate,
-          normalized.worldContext,
-          normalized.simulationRules,
-          normalized.recommendedDifficulty,
-          JSON.stringify(normalized.playableNationCodes),
-          JSON.stringify(normalized.aiModels),
-          timestamp,
-          timestamp,
-        );
-      this.replacePresetStudio(id, normalized.prompts, normalized.helpers);
-      this.database.exec('COMMIT');
-    } catch (error) {
-      this.database.exec('ROLLBACK');
-      throw error;
-    }
-    return this.getPreset(id);
+    return this.presets.createPreset(input);
   }
 
   updatePreset(id: string, input: UpdatePresetInput): PresetDetail {
-    const current = this.getPreset(id);
-    if (current.status === 'archived') {
-      throw new AppError(409, 'PRESET_ARCHIVED', 'An archived preset cannot be edited.');
-    }
-    const normalized = this.normalizePresetInput({
-      title: input.title ?? current.title,
-      summary: input.summary ?? current.summary,
-      category: input.category ?? current.category,
-      tags: input.tags ?? current.tags,
-      startDate: input.startDate ?? current.startDate,
-      worldContext: input.worldContext ?? current.worldContext,
-      simulationRules: input.simulationRules ?? current.simulationRules,
-      recommendedDifficulty: input.recommendedDifficulty ?? current.recommendedDifficulty,
-      playableNationCodes: input.playableNationCodes ?? current.playableNationCodes,
-      aiModels: input.aiModels ?? current.aiModels,
-      prompts: input.prompts ?? current.prompts,
-      helpers: input.helpers ?? current.helpers,
-    });
-    this.database.exec('BEGIN IMMEDIATE');
-    try {
-      this.database
-        .prepare(
-          `UPDATE presets SET title = ?, summary = ?, category = ?, tags = ?, start_date = ?,
-           world_context = ?, simulation_rules = ?, recommended_difficulty = ?,
-           playable_nation_codes = ?, ai_models = ?, updated_at = ? WHERE id = ?`,
-        )
-        .run(
-          normalized.title,
-          normalized.summary,
-          normalized.category,
-          JSON.stringify(normalized.tags),
-          normalized.startDate,
-          normalized.worldContext,
-          normalized.simulationRules,
-          normalized.recommendedDifficulty,
-          JSON.stringify(normalized.playableNationCodes),
-          JSON.stringify(normalized.aiModels),
-          now(),
-          id,
-        );
-      this.replacePresetStudio(id, normalized.prompts, normalized.helpers);
-      this.database.exec('COMMIT');
-    } catch (error) {
-      this.database.exec('ROLLBACK');
-      throw error;
-    }
-    return this.getPreset(id);
+    return this.presets.updatePreset(id, input);
   }
 
   publishPreset(id: string) {
-    const preset = this.getPreset(id);
-    const version = preset.currentVersion + 1;
-    const timestamp = now();
+    return this.presets.publishPreset(id);
+  }
+
+  archivePreset(id: string) {
+    return this.presets.archivePreset(id);
+  }
+
+  duplicatePreset(id: string) {
+    return this.presets.duplicatePreset(id);
+  }
+
+  previewPreset(id: string, gameId?: string) {
+    return this.presets.previewPreset(id, gameId);
+  }
+
+  applyPresetInitialWorld(gameId: string, initialWorld: PresetInitialWorld) {
+    if (!initialWorld.regions.length && !Object.keys(initialWorld.capitalRegionIds).length) return;
     this.database.exec('BEGIN IMMEDIATE');
     try {
-      this.database
-        .prepare(
-          `INSERT INTO preset_versions (id, preset_id, version, snapshot, created_at)
-           VALUES (?, ?, ?, ?, ?)`,
-        )
-        .run(randomUUID(), id, version, JSON.stringify(preset), timestamp);
-      this.database
-        .prepare(
-          `UPDATE presets SET status = 'published', current_version = ?, updated_at = ?
-           WHERE id = ?`,
-        )
-        .run(version, timestamp, id);
+      const updateRegion = this.database.prepare(
+        `UPDATE game_regions SET owner_nation_code = ?, controller_nation_code = ?,
+         claim_nation_codes = ?, region_type = ?, updated_at = ?
+         WHERE game_id = ? AND region_id = ?`,
+      );
+      for (const region of initialWorld.regions) {
+        this.assertRegion(gameId, region.regionId);
+        for (const code of [
+          region.ownerNationCode,
+          region.controllerNationCode,
+          ...region.claimNationCodes,
+        ]) {
+          if (code && !this.nationExistsForGame(gameId, code)) {
+            throw new AppError(400, 'UNKNOWN_NATION', `Unknown preset nation: ${code}.`);
+          }
+        }
+        updateRegion.run(
+          region.ownerNationCode,
+          region.controllerNationCode,
+          JSON.stringify(region.claimNationCodes),
+          region.regionType,
+          now(),
+          gameId,
+          region.regionId,
+        );
+        this.markHistoricalDivergence(
+          gameId,
+          'region',
+          region.regionId,
+          'The custom preset overrides the historical territory.',
+        );
+      }
+      for (const [nationCode, regionId] of Object.entries(initialWorld.capitalRegionIds)) {
+        if (!this.nationExistsForGame(gameId, nationCode)) {
+          throw new AppError(400, 'UNKNOWN_NATION', `Unknown preset nation: ${nationCode}.`);
+        }
+        const feature = regionId
+          ? (this.database
+              .prepare(
+                `SELECT id FROM map_features
+                 WHERE game_id = ? AND region_id = ? ORDER BY feature_type = 'capital' DESC, rowid
+                 LIMIT 1`,
+              )
+              .get(gameId, regionId) as Row | undefined)
+          : undefined;
+        this.database
+          .prepare(
+            `UPDATE nation_states SET capital_feature_id = ?, capital_status = ?
+             WHERE game_id = ? AND nation_code = ?`,
+          )
+          .run(
+            feature ? text(feature.id) : null,
+            feature ? 'established' : 'lost',
+            gameId,
+            nationCode,
+          );
+        this.markHistoricalDivergence(
+          gameId,
+          'capital',
+          nationCode,
+          'The custom preset overrides the historical capital.',
+        );
+      }
       this.database.exec('COMMIT');
     } catch (error) {
       this.database.exec('ROLLBACK');
       throw error;
     }
-    return this.getPreset(id);
   }
 
-  archivePreset(id: string) {
-    this.expectChange(
-      this.database
-        .prepare("UPDATE presets SET status = 'archived', updated_at = ? WHERE id = ?")
-        .run(now(), id),
-      'Preset',
-    );
-  }
-
-  duplicatePreset(id: string) {
-    const preset = this.getPreset(id);
-    return this.createPreset({
-      ...preset,
-      title: `${preset.title} — copie`,
-      summary: preset.summary,
-    });
-  }
-
-  previewPreset(id: string, gameId?: string) {
-    const preset = this.getPreset(id);
-    const game = gameId
-      ? (this.database.prepare('SELECT * FROM games WHERE id = ?').get(gameId) as Row | undefined)
-      : undefined;
-    const values: Record<PresetHelper['source'], unknown> = {
-      'game.date': game?.current_date ?? preset.startDate,
-      'game.turn': game?.turn_number ?? 1,
-      'game.player': game?.player_nation_code ?? preset.playableNationCodes[0],
-      'game.world': game?.world_context ?? preset.worldContext,
-      'game.rules': game?.simulation_rules ?? preset.simulationRules,
-    };
-    const helpers = Object.fromEntries(
-      preset.helpers.map((helper) => [
-        helper.key,
-        helper.format === 'json'
-          ? JSON.stringify(values[helper.source])
-          : text(values[helper.source]),
-      ]),
-    );
-    const prompts = preset.prompts.map((prompt) => ({
-      ...prompt,
-      preview: Object.entries(helpers).reduce(
-        (result, [key, value]) => result.replaceAll(`\${${key}}`, value),
-        prompt.template,
-      ),
-    }));
-    return { helpers, prompts };
-  }
-
-  private normalizePresetInput(input: CreatePresetInput) {
-    const playableNationCodes = input.playableNationCodes?.length
-      ? [...new Set(input.playableNationCodes)]
-      : ['FRA'];
-    for (const code of playableNationCodes) {
-      if (!this.catalog.nations.has(code)) {
-        throw new AppError(400, 'UNKNOWN_NATION', `Unknown playable nation: ${code}.`);
+  private applyWorldEffect(
+    gameId: string,
+    turnNumber: number,
+    effect: WorldEffect,
+    context: MutationContext,
+  ) {
+    if (effect.kind === 'territory') {
+      const row = this.database
+        .prepare('SELECT * FROM game_regions WHERE game_id = ? AND region_id = ?')
+        .get(gameId, effect.regionId) as Row | undefined;
+      if (!row) throw notFound('Region');
+      const owner = nullableText(row.owner_nation_code);
+      const claims = parseJson<string[]>(row.claim_nation_codes, []);
+      if (effect.operation === 'cede') {
+        this.updateRegion(
+          gameId,
+          effect.regionId,
+          {
+            ownerNationCode: effect.nationCode,
+            controllerNationCode: effect.nationCode,
+            claimNationCodes: claims.filter((code) => code !== owner && code !== effect.nationCode),
+          },
+          turnNumber,
+          context,
+        );
+        this.updateCapitalAfterTerritoryEffect(
+          gameId,
+          turnNumber,
+          effect.regionId,
+          owner,
+          effect,
+          context,
+        );
+        return;
       }
+      if (effect.operation === 'annex') {
+        this.updateRegion(
+          gameId,
+          effect.regionId,
+          {
+            ownerNationCode: effect.nationCode,
+            controllerNationCode: effect.nationCode,
+            claimNationCodes:
+              owner && owner !== effect.nationCode
+                ? [...new Set([...claims, owner])].filter((code) => code !== effect.nationCode)
+                : claims.filter((code) => code !== effect.nationCode),
+          },
+          turnNumber,
+          context,
+        );
+        this.updateCapitalAfterTerritoryEffect(
+          gameId,
+          turnNumber,
+          effect.regionId,
+          owner,
+          effect,
+          context,
+        );
+        return;
+      }
+      if (effect.operation === 'occupy') {
+        this.updateRegion(
+          gameId,
+          effect.regionId,
+          { controllerNationCode: effect.nationCode },
+          turnNumber,
+          context,
+        );
+        this.updateCapitalOccupation(
+          gameId,
+          turnNumber,
+          effect.regionId,
+          effect.nationCode,
+          context,
+        );
+        return;
+      }
+      if (effect.operation === 'liberate') {
+        this.updateRegion(
+          gameId,
+          effect.regionId,
+          { controllerNationCode: owner },
+          turnNumber,
+          context,
+        );
+        this.updateCapitalOccupation(gameId, turnNumber, effect.regionId, owner, context);
+        return;
+      }
+      this.updateRegion(
+        gameId,
+        effect.regionId,
+        {
+          claimNationCodes:
+            effect.operation === 'add_claim'
+              ? [...new Set([...claims, effect.nationCode])]
+              : claims.filter((code) => code !== effect.nationCode),
+        },
+        turnNumber,
+        context,
+      );
+      return;
     }
-    return {
-      title: input.title,
-      summary: input.summary ?? '',
-      category: input.category ?? 'custom',
-      tags: [...new Set(input.tags ?? [])],
-      startDate: input.startDate,
-      worldContext: input.worldContext,
-      simulationRules: input.simulationRules,
-      recommendedDifficulty: input.recommendedDifficulty ?? 'normal',
-      playableNationCodes,
-      aiModels: {
-        actions: null,
-        advisor: null,
-        diplomacy: null,
-        turns: null,
-        ...(input.aiModels ?? {}),
-      },
-      prompts: input.prompts ?? [],
-      helpers: input.helpers ?? [],
-    } satisfies Omit<PresetDetail, 'id' | 'status' | 'currentVersion' | 'createdAt' | 'updatedAt'>;
+
+    if (effect.kind === 'unit') {
+      if (effect.operation === 'create') {
+        this.applyUnitChange(
+          gameId,
+          turnNumber,
+          {
+            operation: 'create',
+            name: effect.name,
+            unit_type: effect.unitType,
+            nation_code: effect.nationCode,
+            region_id: effect.regionId,
+            strength: effect.strength,
+            organization: effect.organization,
+          },
+          context,
+        );
+      } else if (effect.operation === 'move') {
+        this.applyUnitChange(
+          gameId,
+          turnNumber,
+          { operation: 'move', unit_id: effect.unitId, region_id: effect.regionId },
+          context,
+        );
+      } else if (effect.operation === 'update') {
+        this.applyUnitChange(
+          gameId,
+          turnNumber,
+          {
+            operation: 'update',
+            unit_id: effect.unitId,
+            ...(effect.strength !== undefined ? { strength: effect.strength } : {}),
+            ...(effect.organization !== undefined ? { organization: effect.organization } : {}),
+            ...(effect.experience !== undefined ? { experience: effect.experience } : {}),
+          },
+          context,
+        );
+      } else {
+        this.applyUnitChange(
+          gameId,
+          turnNumber,
+          { operation: 'delete', unit_id: effect.unitId },
+          context,
+        );
+      }
+      return;
+    }
+
+    if (effect.kind === 'feature') {
+      if (effect.operation === 'create') {
+        this.createMapFeature(
+          gameId,
+          {
+            name: effect.name,
+            featureType: effect.featureType,
+            regionId: effect.regionId,
+            nationCode: effect.nationCode,
+            coords: this.regionCoordinates(effect.regionId),
+          },
+          turnNumber,
+          context,
+        );
+      } else if (effect.operation === 'update') {
+        this.updateMapFeature(
+          gameId,
+          effect.featureId,
+          {
+            ...(effect.name !== undefined ? { name: effect.name } : {}),
+            ...(effect.regionId !== undefined ? { regionId: effect.regionId } : {}),
+            ...(effect.nationCode !== undefined ? { nationCode: effect.nationCode } : {}),
+          },
+          turnNumber,
+          context,
+        );
+      } else {
+        this.deleteMapFeature(gameId, effect.featureId, turnNumber, context);
+      }
+      return;
+    }
+
+    if (effect.kind === 'law') {
+      if (!this.catalog.nations.has(effect.nationCode)) {
+        throw new AppError(400, 'UNKNOWN_NATION', 'The law nation does not exist.');
+      }
+      const date = text(
+        (
+          this.database
+            .prepare('SELECT games.current_date FROM games WHERE id = ?')
+            .get(gameId) as Row
+        ).current_date,
+      );
+      if (effect.operation === 'enact') {
+        const id = randomUUID();
+        const value = {
+          id,
+          game_id: gameId,
+          nation_code: effect.nationCode,
+          title_fr: effect.title,
+          title_en: effect.title,
+          summary_fr: effect.summary,
+          summary_en: effect.summary,
+          category: effect.category,
+          enacted_date: date,
+          status: 'active',
+          repealed_date: null,
+          source: 'player',
+          source_action_id: context.sourceActionId ?? null,
+        };
+        this.insertRows('country_laws', [value]);
+        this.recordMutation(gameId, turnNumber, 'law', id, null, value, context);
+      } else {
+        const row = this.database
+          .prepare(
+            `SELECT * FROM country_laws
+             WHERE id = ? AND game_id = ? AND nation_code = ? AND status = 'active'`,
+          )
+          .get(effect.lawId, gameId, effect.nationCode) as Row | undefined;
+        if (!row) throw notFound('Active law');
+        this.database
+          .prepare(
+            `UPDATE country_laws SET status = 'repealed', repealed_date = ?
+             WHERE id = ? AND game_id = ?`,
+          )
+          .run(date, effect.lawId, gameId);
+        this.recordMutation(
+          gameId,
+          turnNumber,
+          'law',
+          effect.lawId,
+          row,
+          { ...row, status: 'repealed', repealed_date: date },
+          context,
+        );
+      }
+      return;
+    }
+
+    if (effect.kind === 'capital') {
+      if (!this.catalog.nations.has(effect.nationCode)) {
+        throw new AppError(400, 'UNKNOWN_NATION', 'The capital nation does not exist.');
+      }
+      if (effect.featureId) {
+        const feature = this.database
+          .prepare('SELECT * FROM map_features WHERE id = ? AND game_id = ?')
+          .get(effect.featureId, gameId) as Row | undefined;
+        if (!feature) throw notFound('Capital feature');
+      }
+      const before = this.database
+        .prepare('SELECT * FROM nation_states WHERE game_id = ? AND nation_code = ?')
+        .get(gameId, effect.nationCode) as Row | undefined;
+      if (!before) throw notFound('Nation state');
+      const status = effect.featureId ? 'established' : 'lost';
+      this.database
+        .prepare(
+          `UPDATE nation_states SET capital_feature_id = ?, capital_status = ?
+           WHERE game_id = ? AND nation_code = ?`,
+        )
+        .run(effect.featureId, status, gameId, effect.nationCode);
+      this.recordMutation(
+        gameId,
+        turnNumber,
+        'capital',
+        effect.nationCode,
+        before,
+        { ...before, capital_feature_id: effect.featureId, capital_status: status },
+        context,
+      );
+      return;
+    }
+
+    this.applyNationAdjustment(gameId, turnNumber, effect, context);
   }
 
-  private replacePresetStudio(id: string, prompts: PresetPrompt[], helpers: PresetHelper[]) {
-    this.database.prepare('DELETE FROM preset_prompts WHERE preset_id = ?').run(id);
-    this.database.prepare('DELETE FROM preset_helpers WHERE preset_id = ?').run(id);
-    const insertPrompt = this.database.prepare(
-      `INSERT INTO preset_prompts (preset_id, mechanic, mode, template)
-       VALUES (?, ?, ?, ?)`,
-    );
-    for (const prompt of prompts) {
-      insertPrompt.run(id, prompt.mechanic, prompt.mode, prompt.template);
-    }
-    const insertHelper = this.database.prepare(
-      `INSERT INTO preset_helpers (preset_id, helper_key, label, source, format)
-       VALUES (?, ?, ?, ?, ?)`,
-    );
-    for (const helper of helpers) {
-      insertHelper.run(id, helper.key, helper.label, helper.source, helper.format);
-    }
-  }
-
-  private applyUnitChange(gameId: string, turnNumber: number, change: GeneratedUnitChange) {
+  private applyUnitChange(
+    gameId: string,
+    turnNumber: number,
+    change: GeneratedUnitChange,
+    context: MutationContext = { source: 'simulation' },
+  ) {
     if (change.operation === 'create') {
       this.assertRegion(gameId, change.region_id);
       if (!this.catalog.nations.has(change.nation_code)) {
@@ -929,7 +1334,7 @@ export class AdvancedRepository {
         created_at: now(),
       };
       this.insertRows('units', [value]);
-      this.recordMutation(gameId, turnNumber, 'unit', id, null, value);
+      this.recordMutation(gameId, turnNumber, 'unit', id, null, value, context);
       return;
     }
     const row = this.database
@@ -941,7 +1346,7 @@ export class AdvancedRepository {
       this.database
         .prepare('DELETE FROM units WHERE id = ? AND game_id = ?')
         .run(change.unit_id, gameId);
-      this.recordMutation(gameId, turnNumber, 'unit', change.unit_id, row, null);
+      this.recordMutation(gameId, turnNumber, 'unit', change.unit_id, row, null, context);
       return;
     }
     if (change.operation === 'move') {
@@ -971,13 +1376,14 @@ export class AdvancedRepository {
     const updated = this.database
       .prepare('SELECT * FROM units WHERE id = ? AND game_id = ?')
       .get(change.unit_id, gameId) as Row;
-    this.recordMutation(gameId, turnNumber, 'unit', change.unit_id, row, updated);
+    this.recordMutation(gameId, turnNumber, 'unit', change.unit_id, row, updated, context);
   }
 
   private applyFeatureChange(
     gameId: string,
     turnNumber: number,
     change: GeneratedMapFeatureChange,
+    context: MutationContext = { source: 'simulation' },
   ) {
     if (change.operation === 'create') {
       this.createMapFeature(
@@ -992,6 +1398,7 @@ export class AdvancedRepository {
           coords: this.regionCoordinates(change.region_id),
         },
         turnNumber,
+        context,
       );
       return;
     }
@@ -1006,7 +1413,7 @@ export class AdvancedRepository {
       );
     }
     if (change.operation === 'delete') {
-      this.deleteMapFeature(gameId, change.feature_id, turnNumber);
+      this.deleteMapFeature(gameId, change.feature_id, turnNumber, context);
       return;
     }
     this.updateMapFeature(
@@ -1020,7 +1427,137 @@ export class AdvancedRepository {
         ...(change.symbol ? { symbol: change.symbol } : {}),
       },
       turnNumber,
+      context,
     );
+  }
+
+  private updateCapitalAfterTerritoryEffect(
+    gameId: string,
+    turnNumber: number,
+    regionId: string,
+    formerOwner: string | null,
+    effect: WorldEffect,
+    context: MutationContext,
+  ) {
+    if (!formerOwner || effect.kind !== 'territory') return;
+    const before = this.database
+      .prepare(
+        `SELECT ns.* FROM nation_states ns
+         JOIN map_features mf ON mf.id = ns.capital_feature_id AND mf.game_id = ns.game_id
+         WHERE ns.game_id = ? AND ns.nation_code = ? AND mf.region_id = ?`,
+      )
+      .get(gameId, formerOwner, regionId) as Row | undefined;
+    if (!before) return;
+    this.database
+      .prepare(
+        `UPDATE nation_states SET capital_feature_id = NULL, capital_status = 'lost'
+         WHERE game_id = ? AND nation_code = ?`,
+      )
+      .run(gameId, formerOwner);
+    this.recordMutation(
+      gameId,
+      turnNumber,
+      'capital',
+      formerOwner,
+      before,
+      { ...before, capital_feature_id: null, capital_status: 'lost' },
+      context,
+    );
+    this.database
+      .prepare(
+        `UPDATE map_features SET nation_code = ?, feature_type = 'city', updated_at = ?
+         WHERE id = ? AND game_id = ?`,
+      )
+      .run(effect.nationCode, now(), sqlValue(before.capital_feature_id), gameId);
+  }
+
+  private updateCapitalOccupation(
+    gameId: string,
+    turnNumber: number,
+    regionId: string,
+    controllerNationCode: string | null,
+    context: MutationContext,
+  ) {
+    const capital = this.database
+      .prepare(
+        `SELECT ns.*, mf.region_id FROM nation_states ns
+         JOIN map_features mf ON mf.id = ns.capital_feature_id AND mf.game_id = ns.game_id
+         WHERE ns.game_id = ? AND mf.region_id = ?`,
+      )
+      .get(gameId, regionId) as Row | undefined;
+    if (!capital) return;
+    const status = controllerNationCode === text(capital.nation_code) ? 'established' : 'occupied';
+    if (text(capital.capital_status) === status) return;
+    this.database
+      .prepare(`UPDATE nation_states SET capital_status = ? WHERE game_id = ? AND nation_code = ?`)
+      .run(status, gameId, sqlValue(capital.nation_code));
+    this.recordMutation(
+      gameId,
+      turnNumber,
+      'capital',
+      text(capital.nation_code),
+      capital,
+      { ...capital, capital_status: status },
+      context,
+    );
+  }
+
+  private applyNationAdjustment(
+    gameId: string,
+    turnNumber: number,
+    effect: Extract<WorldEffect, { kind: 'nation' }>,
+    context: MutationContext,
+  ) {
+    const before = this.database
+      .prepare('SELECT * FROM nation_states WHERE game_id = ? AND nation_code = ?')
+      .get(gameId, effect.nationCode) as Row | undefined;
+    if (!before) throw notFound('Nation state');
+    const allowed: Record<string, string> = {
+      stability: 'stability',
+      warSupport: 'war_support',
+      manpower: 'manpower',
+      politicalPower: 'political_power',
+      treasury: 'treasury',
+      atWar: 'at_war',
+      occupiedRegions: 'occupied_regions',
+      population: 'population',
+      gdp: 'gdp',
+      happiness: 'happiness',
+      literacy: 'literacy',
+      unemployment: 'unemployment',
+      inflation: 'inflation',
+      industrialCapacity: 'industrial_capacity',
+      health: 'health',
+      foodSecurity: 'food_security',
+    };
+    const assignments: string[] = [];
+    const values: SQLInputValue[] = [];
+    const after = { ...before };
+    for (const [key, value] of Object.entries(effect.changes)) {
+      const column = allowed[key];
+      if (!column) {
+        throw new AppError(400, 'INVALID_WORLD_EFFECT', `Unsupported nation indicator: ${key}.`);
+      }
+      assignments.push(`${column} = ?`);
+      const persisted =
+        typeof value === 'boolean'
+          ? value
+            ? 1
+            : 0
+          : Array.isArray(value)
+            ? JSON.stringify(value)
+            : value;
+      values.push(persisted);
+      after[column] = persisted;
+    }
+    if (assignments.length === 0) return;
+    this.database
+      .prepare(
+        `UPDATE nation_states SET ${assignments.join(', ')}
+         WHERE game_id = ? AND nation_code = ?`,
+      )
+      .run(...values, gameId, effect.nationCode);
+    this.recordMutation(gameId, turnNumber, 'nation', effect.nationCode, before, after, context);
   }
 
   private regionCoordinates(regionId: string): [number, number] {
@@ -1035,28 +1572,53 @@ export class AdvancedRepository {
     return number(row.turn_number);
   }
 
+  private currentWorldRevision(gameId: string) {
+    const row = this.database
+      .prepare('SELECT world_revision FROM games WHERE id = ?')
+      .get(gameId) as Row | undefined;
+    if (!row) throw notFound('Game');
+    return number(row.world_revision);
+  }
+
+  private bumpWorldRevision(gameId: string) {
+    this.database
+      .prepare('UPDATE games SET world_revision = world_revision + 1, updated_at = ? WHERE id = ?')
+      .run(now(), gameId);
+  }
+
   private recordMutation(
     gameId: string,
     turnNumber: number,
-    mutationType: string,
+    mutationType: AppliedMutation['mutationType'],
     targetId: string,
     before: unknown,
     after: unknown,
+    context: MutationContext = { source: 'simulation' },
   ) {
+    const worldRevision =
+      context.source === 'manual'
+        ? this.currentWorldRevision(gameId) + 1
+        : this.currentWorldRevision(gameId) + 1;
     this.database
       .prepare(
         `INSERT INTO world_mutations (
-          id, game_id, turn_number, mutation_type, target_id, before_value, after_value, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          id, game_id, turn_number, mutation_source, source_action_id, source_event_id,
+          mutation_type, target_id, before_value, after_value, effect_json, world_revision, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         randomUUID(),
         gameId,
         turnNumber,
+        context.source,
+        context.sourceActionId ?? null,
+        context.sourceEventId ?? null,
         mutationType,
         targetId,
         before === null ? null : JSON.stringify(before),
         after === null ? null : JSON.stringify(after),
+        context.effect ? JSON.stringify(context.effect) : null,
+        worldRevision,
         now(),
       );
   }
@@ -1089,6 +1651,39 @@ export class AdvancedRepository {
     if (!this.database.prepare('SELECT 1 FROM games WHERE id = ?').get(gameId)) {
       throw notFound('Game');
     }
+  }
+
+  private nationExistsForGame(gameId: string, nationCode: string) {
+    return Boolean(
+      this.database
+        .prepare('SELECT 1 FROM game_polities WHERE game_id = ? AND nation_code = ?')
+        .get(gameId, nationCode) || this.catalog.nations.has(nationCode),
+    );
+  }
+
+  private markHistoricalDivergence(
+    gameId: string,
+    entityType: 'polity' | 'office' | 'capital' | 'region',
+    entityId: string,
+    reason: string,
+  ) {
+    const game = this.database
+      .prepare(
+        'SELECT games.current_date AS game_date, historical_baseline_mode FROM games WHERE id = ?',
+      )
+      .get(gameId) as Row | undefined;
+    if (!game || text(game.historical_baseline_mode) !== 'historical_v1') return;
+    const timestamp = now();
+    this.database
+      .prepare(
+        `INSERT INTO historical_continuity (
+          game_id, entity_type, entity_id, continuity_status, diverged_at, reason, updated_at
+        ) VALUES (?, ?, ?, 'diverged', ?, ?, ?)
+        ON CONFLICT(game_id, entity_type, entity_id) DO UPDATE SET
+          continuity_status = 'diverged', diverged_at = excluded.diverged_at,
+          reason = excluded.reason, updated_at = excluded.updated_at`,
+      )
+      .run(gameId, entityType, entityId, text(game.game_date), reason, timestamp);
   }
 
   private assertRegion(gameId: string, regionId: string) {
@@ -1180,23 +1775,6 @@ export class AdvancedRepository {
     color: text(row.color),
     symbol: text(row.symbol),
     coords: [number(row.coords_x), number(row.coords_y)],
-    createdAt: text(row.created_at),
-    updatedAt: text(row.updated_at),
-  });
-
-  private mapPreset = (row: Row): Preset => ({
-    id: text(row.id),
-    title: text(row.title),
-    summary: text(row.summary),
-    category: text(row.category) as Preset['category'],
-    tags: parseJson(row.tags, []),
-    startDate: text(row.start_date),
-    worldContext: text(row.world_context),
-    simulationRules: text(row.simulation_rules),
-    recommendedDifficulty: text(row.recommended_difficulty) as Preset['recommendedDifficulty'],
-    playableNationCodes: parseJson(row.playable_nation_codes, []),
-    status: text(row.status) as Preset['status'],
-    currentVersion: number(row.current_version),
     createdAt: text(row.created_at),
     updatedAt: text(row.updated_at),
   });

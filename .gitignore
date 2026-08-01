@@ -22,6 +22,8 @@ data/llm_settings.json
 
 # Editors and operating systems
 .codex-remote-attachments/
+.codex/.verification/
+.codex/ui-check/
 .idea/
 .vscode/
 .DS_Store

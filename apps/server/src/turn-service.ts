@@ -7,6 +7,7 @@ import type {
 import { addTime, applyEventChanges, applyNaturalEvolution } from '@what-if-history/core';
 import type { Repository } from './db/repository.js';
 import type { AdvancedRepository } from './db/advanced-repository.js';
+import type { StrategicRepository } from './db/strategic-repository.js';
 import { AppError } from './errors.js';
 import type { LlmActivityTracker } from './llm/activity.js';
 import type { GenerationLanguage, LlmService } from './llm/service.js';
@@ -18,6 +19,7 @@ export class TurnService {
   constructor(
     private readonly repository: Repository,
     private readonly advanced: AdvancedRepository,
+    private readonly strategic: StrategicRepository,
     private readonly llm: LlmService,
     private readonly stream: SseHub,
     private readonly activity: LlmActivityTracker,
@@ -27,8 +29,11 @@ export class TurnService {
     gameId: string,
     jump: TimeJump,
     request: { requestId: string; clientId: string },
+    idempotencyKey: string,
     language: GenerationLanguage = 'fr',
   ): Promise<TurnResult> {
+    const completed = this.advanced.findCompletedTurnResult(gameId, idempotencyKey);
+    if (completed) return completed;
     if (this.activeGames.has(gameId)) {
       throw new AppError(
         409,
@@ -39,8 +44,9 @@ export class TurnService {
     const game = this.repository.getGame(gameId);
     const actions = this.repository.listActions(gameId);
     const pendingActions = actions.filter((action) => action.status === 'pending');
+    this.advanced.validateQueuedActionRevisions(gameId, pendingActions);
     const recentEvents = this.repository.listEvents(gameId).slice(0, 8).reverse();
-    const turnRunId = this.advanced.startTurnRun(gameId, game.turnNumber, jump);
+    const turnRunId = this.advanced.startTurnRun(gameId, game.turnNumber, jump, idempotencyKey);
     const snapshot = this.advanced.createSnapshot(
       gameId,
       language === 'en' ? `Before turn ${game.turnNumber}` : `Avant le tour ${game.turnNumber}`,
@@ -64,6 +70,7 @@ export class TurnService {
         recentEvents,
         activity,
         language,
+        this.strategic.listCharacters(gameId),
       );
       const effectiveJump: TimeJump =
         jump.strategy === 'next_major_event'
@@ -77,6 +84,16 @@ export class TurnService {
         game.nationStates.map((state) => state.nationCode),
         generated.value.events,
       );
+      const confirmedTerritoryIds = new Set(
+        pendingActions.flatMap((action) =>
+          action.effects
+            .filter((effect) => effect.kind === 'territory')
+            .map((effect) => effect.regionId),
+        ),
+      );
+      const secondaryRegionChanges = generated.value.region_changes.filter(
+        (change) => !confirmedTerritoryIds.has(change.region_id),
+      );
       const nextDate = addTime(game.currentDate, effectiveJump);
       const states = applyEventChanges(
         applyNaturalEvolution(
@@ -87,32 +104,96 @@ export class TurnService {
       );
       activity.phase('applying_result');
       this.advanced.updateTurnRun(turnRunId, 'applying');
-      const events = this.repository.commitTurn(
+      let result: TurnResult | undefined;
+      this.repository.commitTurn(
         gameId,
         game.turnNumber,
         nextDate,
         states,
         generatedEvents,
         generated.value.law_changes,
-        () =>
+        (persistedEvents) => {
+          this.advanced.applyActionEffects(gameId, game.turnNumber, pendingActions);
+          this.advanced.recordNationStateChanges(
+            gameId,
+            game.turnNumber,
+            game.nationStates,
+            states,
+            persistedEvents,
+          );
           this.advanced.applyWorldChanges(
             gameId,
             game.turnNumber,
-            generated.value.region_changes,
+            secondaryRegionChanges,
             generated.value.unit_changes,
             generated.value.map_feature_changes,
-          ),
+            persistedEvents.length === 1 ? persistedEvents[0]?.id : undefined,
+          );
+          this.strategic.applyCharacterChanges(
+            gameId,
+            generated.value.character_changes,
+            nextDate,
+            game.turnNumber,
+          );
+          this.strategic.advanceDailySimulation(
+            gameId,
+            game.currentDate,
+            nextDate,
+            game.turnNumber,
+          );
+          for (const event of persistedEvents) {
+            this.strategic.appendEventTimeline(gameId, event);
+          }
+          const worldRevision = game.worldRevision + 1;
+          const appliedMutations = this.advanced
+            .listWorldMutations(gameId)
+            .filter((mutation) => mutation.worldRevision === worldRevision);
+          result = {
+            previousDate: game.currentDate,
+            newDate: nextDate,
+            turnNumber: game.turnNumber + 1,
+            events: persistedEvents,
+            processedActions: pendingActions.length,
+            worldRevision,
+            appliedMutations,
+          };
+          this.advanced.completeTurnRunInTransaction(
+            turnRunId,
+            result,
+            generated.value,
+            generated.schemaMode ?? 'server_validation',
+            generated.repairAttempts ?? 0,
+          );
+        },
       );
+      if (!result) throw new AppError(500, 'TURN_COMMIT_FAILED', 'The turn result was not stored.');
       this.advanced.maybeCreateConsolidation(gameId, game.turnNumber);
-      this.advanced.updateTurnRun(turnRunId, 'completed');
       activity.succeed(generated.usage);
-      const result: TurnResult = {
-        previousDate: game.currentDate,
-        newDate: nextDate,
-        turnNumber: game.turnNumber + 1,
-        events,
-        processedActions: pendingActions.length,
-      };
+      this.stream.publish(gameId, 'world.changed', {
+        gameId,
+        worldRevision: result.worldRevision,
+        regionIds: [
+          ...new Set(
+            result.appliedMutations
+              .filter((mutation) => mutation.mutationType === 'region')
+              .map((mutation) => mutation.targetId),
+          ),
+        ],
+        unitIds: [
+          ...new Set(
+            result.appliedMutations
+              .filter((mutation) => mutation.mutationType === 'unit')
+              .map((mutation) => mutation.targetId),
+          ),
+        ],
+        featureIds: [
+          ...new Set(
+            result.appliedMutations
+              .filter((mutation) => mutation.mutationType === 'feature')
+              .map((mutation) => mutation.targetId),
+          ),
+        ],
+      });
       this.stream.publish(gameId, 'turn.completed', result);
       return result;
     } catch (error) {

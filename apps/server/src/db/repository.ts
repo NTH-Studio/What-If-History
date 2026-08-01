@@ -16,59 +16,84 @@ import type {
   GeneratedEvent,
   GeneratedLawChange,
   LlmCallPhase,
-  LlmCallStatus,
-  LlmCallType,
-  LlmProviderName,
   LlmSettingsInput,
   LlmSettingsPublic,
   LlmTokenUsage,
   Nation,
   NationState,
+  PromulgateLawInput,
   ScenarioMode,
   UpdateActionInput,
   UpdateGameConfigInput,
   Unit,
+  WorldEffect,
 } from '@what-if-history/contracts';
 import { createStartingUnits } from '@what-if-history/core';
 import { AppError, notFound } from '../errors.js';
-import type { Catalog, CatalogLanguage } from '../catalog.js';
+import type { Catalog, CatalogLanguage, CountryBaseline } from '../catalog.js';
+import { HistoricalWorldResolver, type HistoricalWorldSnapshot } from '../historical-world.js';
+import { ChatRepository } from './chat-repository.js';
+import { LlmRepository } from './llm-repository.js';
+import {
+  asBoolean,
+  asNullableNumber,
+  asNumber,
+  asString,
+  now,
+  parseJson,
+  type Row,
+} from './values.js';
 
-type Row = Record<string, unknown>;
-const now = () => new Date().toISOString();
-const asBoolean = (value: unknown) => Number(value) === 1;
-const asString = (value: unknown) => String(value ?? '');
-const asNumber = (value: unknown) => Number(value ?? 0);
-const asNullableNumber = (value: unknown) => (value === null ? null : Number(value));
-const historicalWorldContext =
-  'Historical 1936 start. Europe is on the brink of tension as ideologies clash.';
-const parseJson = <T>(value: unknown, fallback: T): T => {
-  try {
-    return JSON.parse(asString(value)) as T;
-  } catch {
-    return fallback;
-  }
-};
+const historicalWorldContext = (startDate: string) =>
+  `Historical campaign beginning on ${startDate}. The campaign date and persisted world state ` +
+  `are authoritative; do not assume a different historical year.`;
 
 export class Repository {
+  private readonly chats: ChatRepository;
+  private readonly llm: LlmRepository;
+
   constructor(
     readonly database: DatabaseSync,
     private readonly catalog: Catalog,
+    private readonly historical = new HistoricalWorldResolver(catalog, catalog.dataDirectory),
   ) {
+    this.chats = new ChatRepository(database, catalog);
+    this.llm = new LlmRepository(database);
     this.initializeCountryProfiles();
     this.initializeCampaignWorlds();
+    this.initializeDynamicCapitals();
+  }
+
+  previewHistoricalWorld(date: string, language: CatalogLanguage = 'en') {
+    return this.historical.preview(date, language);
+  }
+
+  listHistoricalNations(date: string, language: CatalogLanguage = 'en') {
+    return this.historical.resolve(date, language).polities.map((polity) => polity.nation);
   }
 
   createGame(input: CreateGameInput, language: CatalogLanguage = 'en'): Game {
-    const nation = this.catalog.nations.get(input.nationCode);
-    if (!nation) throw new AppError(400, 'UNKNOWN_NATION', 'The selected nation does not exist.');
+    const historicalWorld = this.historical.resolve(input.startDate, language);
+    const selectedPolity = historicalWorld.polities.find(
+      (candidate) => candidate.code === input.nationCode,
+    );
+    if (!selectedPolity) {
+      throw new AppError(
+        400,
+        'NATION_NOT_ACTIVE_AT_DATE',
+        'The selected nation does not exist at the campaign start date.',
+      );
+    }
 
     const id = randomUUID();
     const timestamp = now();
-    const localizedNation = this.catalog.localizeNation(nation, language);
+    const localizedNation = selectedPolity.nation;
     const name = input.name ?? `${localizedNation.name} — ${input.startDate}`;
     const scenarioMode = input.scenario?.mode ?? 'historical';
     const worldContext =
-      input.scenario?.mode === 'custom' ? input.scenario.premise : historicalWorldContext;
+      input.scenario?.mode === 'custom'
+        ? input.scenario.premise
+        : historicalWorldContext(input.startDate);
 
     this.database.exec('BEGIN IMMEDIATE');
     try {
@@ -77,8 +102,8 @@ export class Repository {
           `INSERT INTO games (
             id, name, player_nation_code, current_date, turn_number,
             world_context, simulation_rules, scenario_mode, difficulty, ai_models,
-            preset_id, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, '{}', ?, ?, ?)`,
+            preset_id, historical_baseline_mode, historical_catalog_version, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, '{}', ?, 'historical_v1', ?, ?, ?)`,
         )
         .run(
           id,
@@ -90,6 +115,7 @@ export class Repository {
           scenarioMode,
           input.difficulty ?? 'normal',
           input.presetId ?? null,
+          historicalWorld.catalogVersion,
           timestamp,
           timestamp,
         );
@@ -102,8 +128,9 @@ export class Repository {
           population_growth_rate, gdp_growth_rate, profile_version
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
-      for (const catalogNation of this.catalog.nations.values()) {
-        const baseline = this.catalog.countryBaselines.get(catalogNation.code)!;
+      for (const polity of historicalWorld.polities) {
+        const catalogNation = polity.nation;
+        const baseline = polity.baseline;
         insertState.run(
           id,
           catalogNation.code,
@@ -128,8 +155,19 @@ export class Repository {
           baseline.version,
         );
       }
-      this.seedHistoricalLaws(id, input.startDate);
-      this.seedCampaignWorld(id, timestamp);
+      this.seedHistoricalLaws(
+        id,
+        input.startDate,
+        new Map(historicalWorld.polities.map((polity) => [polity.code, polity.baseline])),
+      );
+      this.seedCampaignWorld(
+        id,
+        timestamp,
+        historicalWorld.regionOwners,
+        historicalWorld.regionStatuses,
+      );
+      this.seedHistoricalSnapshot(id, historicalWorld, timestamp);
+      this.initializeDynamicCapitals();
 
       const insertUnit = this.database.prepare(
         `INSERT INTO units (
@@ -137,7 +175,12 @@ export class Repository {
           strength, organization, experience, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
-      for (const unit of createStartingUnits(id, timestamp, randomUUID)) {
+      const legacyStartingUnits =
+        input.startDate >= '1930-01-01' && input.startDate <= '1945-12-31'
+          ? createStartingUnits(id, timestamp, randomUUID)
+          : [];
+      for (const unit of legacyStartingUnits) {
+        if (!historicalWorld.polities.some((polity) => polity.code === unit.nationCode)) continue;
         insertUnit.run(
           unit.id,
           unit.gameId,
@@ -150,6 +193,23 @@ export class Repository {
           unit.organization,
           unit.experience,
           unit.createdAt,
+        );
+      }
+      if (legacyStartingUnits.length === 0) {
+        const capitalRegion = selectedPolity.capitalRegionId ?? 'Ile_de_France';
+        const city = this.catalog.cities.find((candidate) => candidate.region_id === capitalRegion);
+        insertUnit.run(
+          randomUUID(),
+          id,
+          language === 'fr' ? 'Brigade interarmes' : 'Combined Arms Brigade',
+          input.startDate >= '1916-01-01' ? 'armor' : 'infantry',
+          input.nationCode,
+          capitalRegion,
+          JSON.stringify(city?.coords ?? [700, 300]),
+          100,
+          100,
+          20,
+          timestamp,
         );
       }
       this.database.exec('COMMIT');
@@ -173,7 +233,9 @@ export class Repository {
     if (!row) throw notFound('Game');
 
     const playerNationCode = asString(row.player_nation_code);
-    const playerNation = this.catalog.nations.get(playerNationCode);
+    const playerNation =
+      this.persistedNation(id, playerNationCode, language) ??
+      this.catalog.nations.get(playerNationCode);
     if (!playerNation) throw new AppError(500, 'CATALOG_INVALID', 'The player nation is missing.');
 
     const counts = this.database
@@ -187,7 +249,10 @@ export class Repository {
 
     return {
       ...this.mapGameSummary(row, language),
-      playerNation: this.catalog.localizeNation(playerNation, language),
+      playerNation:
+        asString(row.historical_baseline_mode) === 'historical_v1'
+          ? playerNation
+          : this.catalog.localizeNation(playerNation, language),
       nationStates: this.getNationStates(id),
       presetId: row.preset_id === null ? null : asString(row.preset_id),
       worldContext: asString(row.world_context),
@@ -229,6 +294,14 @@ export class Repository {
     this.expectChange(result, 'Game');
   }
 
+  getWorldRevision(gameId: string) {
+    const row = this.database
+      .prepare('SELECT world_revision FROM games WHERE id = ?')
+      .get(gameId) as Row | undefined;
+    if (!row) throw notFound('Game');
+    return asNumber(row.world_revision);
+  }
+
   getNationStates(gameId: string): NationState[] {
     return (
       this.database
@@ -254,6 +327,8 @@ export class Repository {
       foodSecurity: asNumber(row.food_security),
       populationGrowthRate: asNumber(row.population_growth_rate),
       gdpGrowthRate: asNumber(row.gdp_growth_rate),
+      capitalFeatureId: row.capital_feature_id === null ? null : asString(row.capital_feature_id),
+      capitalStatus: asString(row.capital_status || 'established') as NationState['capitalStatus'],
     }));
   }
 
@@ -271,12 +346,66 @@ export class Repository {
           .all(gameId) as Row[]
       ).map((row) => [asString(row.nation_code), asNumber(row.count)]),
     );
-    return [...this.catalog.nations.values()]
-      .map((catalogNation) => {
-        const nation = this.catalog.localizeNation(catalogNation, language);
+    const territoryCounts = new Map<
+      string,
+      { ownedRegionCount: number; controlledRegionCount: number; claimedRegionCount: number }
+    >();
+    const campaignCapitals = new Map(
+      (
+        this.database
+          .prepare(
+            `SELECT ns.nation_code, mf.name
+             FROM nation_states ns
+             JOIN map_features mf ON mf.id = ns.capital_feature_id AND mf.game_id = ns.game_id
+             WHERE ns.game_id = ? AND ns.capital_status != 'lost'`,
+          )
+          .all(gameId) as Row[]
+      ).map((row) => [asString(row.nation_code), asString(row.name)]),
+    );
+    for (const row of this.database
+      .prepare(
+        `SELECT owner_nation_code, controller_nation_code, claim_nation_codes
+         FROM game_regions WHERE game_id = ?`,
+      )
+      .all(gameId) as Row[]) {
+      const owner = row.owner_nation_code === null ? null : asString(row.owner_nation_code);
+      const controller =
+        row.controller_nation_code === null ? null : asString(row.controller_nation_code);
+      const claims = parseJson<string[]>(row.claim_nation_codes, []);
+      const bump = (
+        code: string,
+        field: 'ownedRegionCount' | 'controlledRegionCount' | 'claimedRegionCount',
+      ) => {
+        const current = territoryCounts.get(code) ?? {
+          ownedRegionCount: 0,
+          controlledRegionCount: 0,
+          claimedRegionCount: 0,
+        };
+        current[field] += 1;
+        territoryCounts.set(code, current);
+      };
+      if (owner) bump(owner, 'ownedRegionCount');
+      if (controller) bump(controller, 'controlledRegionCount');
+      for (const claim of claims) bump(claim, 'claimedRegionCount');
+    }
+    const persistedPolities = this.database
+      .prepare('SELECT * FROM game_polities WHERE game_id = ? ORDER BY nation_code')
+      .all(gameId) as Row[];
+    const sources = persistedPolities.length
+      ? persistedPolities.map((row) => ({
+          nation: this.persistedNation(gameId, asString(row.nation_code), language)!,
+          governmentType: asString(row.government_type),
+          dataQuality: asString(row.data_quality),
+        }))
+      : [...this.catalog.nations.values()].map((catalogNation) => ({
+          nation: this.catalog.localizeNation(catalogNation, language),
+          governmentType: this.catalog.countryBaselines.get(catalogNation.code)!.governmentType,
+          dataQuality: 'estimated',
+        }));
+    return sources
+      .map(({ nation, governmentType }) => {
         const state = states.get(nation.code);
-        const baseline = this.catalog.countryBaselines.get(nation.code);
-        if (!state || !baseline) {
+        if (!state) {
           throw new AppError(
             500,
             'COUNTRY_STATE_MISSING',
@@ -286,14 +415,36 @@ export class Repository {
         return {
           code: nation.code,
           name: nation.name,
-          capital: nation.capital ?? null,
+          capital:
+            state.capitalStatus === 'lost'
+              ? null
+              : (campaignCapitals.get(nation.code) ?? nation.capital ?? null),
           leaderName: nation.leader_name ?? null,
           ideology: nation.ideology,
-          governmentType: baseline.governmentType,
+          governmentType,
           isMajorPower: nation.is_major_power,
           color: nation.color,
           indicators: this.toCountryIndicators(state),
           activeLawCount: lawCounts.get(nation.code) ?? 0,
+          ...(territoryCounts.get(nation.code) ?? {
+            ownedRegionCount: 0,
+            controlledRegionCount: 0,
+            claimedRegionCount: 0,
+          }),
+          capitalStatus: state.capitalStatus,
+          officeHolders: this.listOfficeHolders(gameId, nation.code, language),
+          historicalContinuity: persistedPolities.length
+            ? (
+                this.database
+                  .prepare(
+                    `SELECT continuity_status FROM historical_continuity
+                   WHERE game_id = ? AND entity_type = 'polity' AND entity_id = ?`,
+                  )
+                  .get(gameId, nation.code) as Row | undefined
+              )?.continuity_status === 'diverged'
+              ? ('diverged' as const)
+              : ('historical' as const)
+            : ('legacy_static' as const),
         };
       })
       .sort((left, right) => left.name.localeCompare(right.name, language));
@@ -308,8 +459,17 @@ export class Repository {
       (country) => country.code === nationCode,
     );
     if (!summary) throw notFound('Country');
-    const nation = this.catalog.nations.get(nationCode)!;
-    const baseline = this.catalog.countryBaselines.get(nationCode)!;
+    const nation =
+      this.persistedNation(gameId, nationCode, language) ?? this.catalog.nations.get(nationCode)!;
+    const baseline = this.catalog.countryBaselines.get(nationCode);
+    const gameRow = this.database
+      .prepare(
+        'SELECT games.current_date AS game_date, historical_baseline_mode FROM games WHERE id = ?',
+      )
+      .get(gameId) as Row;
+    const polityRow = this.database
+      .prepare('SELECT data_quality FROM game_polities WHERE game_id = ? AND nation_code = ?')
+      .get(gameId, nationCode) as Row | undefined;
     const state = this.getNationStates(gameId).find((item) => item.nationCode === nationCode)!;
     const laws = this.listCountryLaws(gameId, nationCode, language);
     const recentEvents = this.listEvents(gameId)
@@ -322,14 +482,20 @@ export class Repository {
     ).count;
     return {
       ...summary,
-      leaderTitle: nation.leader_title ?? null,
+      leaderTitle:
+        summary.officeHolders.find((holder) => holder.primary)?.title ??
+        nation.leader_title ??
+        null,
       militaryStrength: nation.military_strength ?? 0,
       occupiedRegions: state.occupiedRegions,
       laws,
       recentEvents,
       unitCount: asNumber(unitCount),
-      dataQuality: 'estimated',
-      baselineDate: baseline.baselineDate,
+      dataQuality: asString(polityRow?.data_quality) === 'historical' ? 'historical' : 'estimated',
+      baselineDate:
+        asString(gameRow.historical_baseline_mode) === 'historical_v1'
+          ? asString(gameRow.game_date)
+          : (baseline?.baselineDate ?? asString(gameRow.game_date)),
     };
   }
 
@@ -387,13 +553,18 @@ export class Repository {
       aiResponse: reason ?? null,
       turnNumber: game.turnNumber,
       createdAt: now(),
+      effects: input.effects ?? [],
+      effectStatus: accepted ? 'queued' : 'failed',
+      previewWorldRevision: input.previewWorldRevision ?? null,
     };
+    this.assertPreviewRevision(gameId, action.effects, action.previewWorldRevision);
     this.database
       .prepare(
         `INSERT INTO actions (
           id, game_id, nation_code, action_text, action_type, status,
-          ai_response, turn_number, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ai_response, turn_number, created_at, effects_json, effect_status,
+          preview_world_revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         action.id,
@@ -405,60 +576,52 @@ export class Repository {
         action.aiResponse,
         action.turnNumber,
         action.createdAt,
+        JSON.stringify(action.effects),
+        action.effectStatus,
+        action.previewWorldRevision,
       );
     return action;
   }
 
-  createPromulgatedLaw(gameId: string, actionText: string, reason: string): Action {
+  createPromulgatedLaw(gameId: string, input: PromulgateLawInput, reason: string): Action {
     const game = this.getGame(gameId);
     const action: Action = {
       id: randomUUID(),
       gameId,
       nationCode: game.playerNationCode,
-      actionText,
+      actionText: input.actionText,
       actionType: 'law',
       status: 'pending',
       aiResponse: reason,
       turnNumber: game.turnNumber,
       createdAt: now(),
+      effects: input.effects ?? [],
+      effectStatus: 'queued',
+      previewWorldRevision: input.previewWorldRevision ?? null,
     };
-    this.database.exec('BEGIN IMMEDIATE');
-    try {
-      this.database
-        .prepare(
-          `INSERT INTO actions (
-            id, game_id, nation_code, action_text, action_type, status,
-            ai_response, turn_number, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          action.id,
-          action.gameId,
-          action.nationCode,
-          action.actionText,
-          action.actionType,
-          action.status,
-          action.aiResponse,
-          action.turnNumber,
-          action.createdAt,
-        );
-      this.insertCountryLaw({
-        gameId,
-        nationCode: game.playerNationCode,
-        titleFr: actionText,
-        titleEn: actionText,
-        summaryFr: reason,
-        summaryEn: reason,
-        category: 'other',
-        enactedDate: game.currentDate,
-        source: 'player',
-        sourceActionId: action.id,
-      });
-      this.database.exec('COMMIT');
-    } catch (error) {
-      this.database.exec('ROLLBACK');
-      throw error;
-    }
+    this.assertPreviewRevision(gameId, action.effects, action.previewWorldRevision);
+    this.database
+      .prepare(
+        `INSERT INTO actions (
+          id, game_id, nation_code, action_text, action_type, status,
+          ai_response, turn_number, created_at, effects_json, effect_status,
+          preview_world_revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        action.id,
+        action.gameId,
+        action.nationCode,
+        action.actionText,
+        action.actionType,
+        action.status,
+        action.aiResponse,
+        action.turnNumber,
+        action.createdAt,
+        JSON.stringify(action.effects),
+        action.effectStatus,
+        action.previewWorldRevision,
+      );
     return action;
   }
 
@@ -479,11 +642,20 @@ export class Repository {
       )
       .get(actionId, gameId) as Row | undefined;
     if (!current) throw notFound('Pending action');
+    const effects = input.effects ?? parseJson<WorldEffect[]>(current.effects_json, []);
+    const previewWorldRevision =
+      input.previewWorldRevision ?? asNullableNumber(current.preview_world_revision);
+    this.assertPreviewRevision(gameId, effects, previewWorldRevision);
     this.database
-      .prepare('UPDATE actions SET action_text = ?, action_type = ? WHERE id = ? AND game_id = ?')
+      .prepare(
+        `UPDATE actions SET action_text = ?, action_type = ?, effects_json = ?,
+         effect_status = 'queued', preview_world_revision = ? WHERE id = ? AND game_id = ?`,
+      )
       .run(
         input.actionText ?? asString(current.action_text),
         input.actionType ?? asString(current.action_type),
+        JSON.stringify(effects),
+        previewWorldRevision,
         actionId,
         gameId,
       );
@@ -576,128 +748,27 @@ export class Repository {
   }
 
   createChat(gameId: string, participantNationCodes: string[]): Chat {
-    this.assertGame(gameId);
-    const uniqueCodes = [...new Set(participantNationCodes)];
-    const nations = uniqueCodes.map((code) => this.catalog.nations.get(code));
-    if (!nations.length || nations.some((nation) => !nation)) {
-      throw new AppError(400, 'UNKNOWN_NATION', 'A target nation does not exist.');
-    }
-    const targetNationCode = uniqueCodes[0]!;
-    const nation = nations[0]!;
-    const chat: Chat = {
-      id: randomUUID(),
-      gameId,
-      targetNationCode,
-      targetNationName: nation.name,
-      participants: nations.map((participant) => ({
-        nationCode: participant!.code,
-        nationName: participant!.name,
-      })),
-      nextSpeakerNationCode: targetNationCode,
-      status: 'active',
-      createdAt: now(),
-    };
-    this.database.exec('BEGIN IMMEDIATE');
-    try {
-      this.database
-        .prepare(
-          `INSERT INTO chats (
-            id, game_id, target_nation_code, next_speaker_nation_code, status, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          chat.id,
-          chat.gameId,
-          chat.targetNationCode,
-          chat.nextSpeakerNationCode,
-          chat.status,
-          chat.createdAt,
-        );
-      const insertParticipant = this.database.prepare(
-        'INSERT INTO chat_participants (chat_id, nation_code, sort_order) VALUES (?, ?, ?)',
-      );
-      uniqueCodes.forEach((code, index) => insertParticipant.run(chat.id, code, index));
-      this.database.exec('COMMIT');
-    } catch (error) {
-      this.database.exec('ROLLBACK');
-      throw error;
-    }
-    return chat;
+    return this.chats.createChat(gameId, participantNationCodes);
   }
 
   setNextChatSpeaker(gameId: string, chatId: string, nationCode: string): Chat {
-    const chat = this.getChat(gameId, chatId);
-    if (!chat.participants.some((participant) => participant.nationCode === nationCode)) {
-      throw new AppError(400, 'NOT_CHAT_PARTICIPANT', 'The nation is not part of this chat.');
-    }
-    this.database
-      .prepare('UPDATE chats SET next_speaker_nation_code = ? WHERE id = ? AND game_id = ?')
-      .run(nationCode, chatId, gameId);
-    return this.getChat(gameId, chatId);
+    return this.chats.setNextChatSpeaker(gameId, chatId, nationCode);
   }
 
   listChats(gameId: string): Chat[] {
-    this.assertGame(gameId);
-    return (
-      this.database
-        .prepare('SELECT * FROM chats WHERE game_id = ? ORDER BY created_at DESC')
-        .all(gameId) as Row[]
-    ).map((row) => this.mapChat(row));
+    return this.chats.listChats(gameId);
   }
 
   getChat(gameId: string, chatId: string): Chat {
-    const row = this.database
-      .prepare('SELECT * FROM chats WHERE id = ? AND game_id = ?')
-      .get(chatId, gameId) as Row | undefined;
-    if (!row) throw notFound('Chat');
-    return this.mapChat(row);
+    return this.chats.getChat(gameId, chatId);
   }
 
   listChatMessages(gameId: string, chatId: string): ChatMessage[] {
-    this.getChat(gameId, chatId);
-    return (
-      this.database
-        .prepare('SELECT * FROM chat_messages WHERE chat_id = ? ORDER BY created_at')
-        .all(chatId) as Row[]
-    ).map(this.mapChatMessage);
+    return this.chats.listChatMessages(gameId, chatId);
   }
 
-  addChatMessage(
-    chat: Chat,
-    senderNation: string,
-    senderName: string,
-    leaderName: string,
-    messageText: string,
-    gameDate: string,
-  ): ChatMessage {
-    const message: ChatMessage = {
-      id: randomUUID(),
-      chatId: chat.id,
-      senderNation,
-      senderName,
-      leaderName,
-      messageText,
-      gameDate,
-      createdAt: now(),
-    };
-    this.database
-      .prepare(
-        `INSERT INTO chat_messages (
-          id, chat_id, sender_nation, sender_name, leader_name,
-          message_text, game_date, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        message.id,
-        message.chatId,
-        message.senderNation,
-        message.senderName,
-        message.leaderName,
-        message.messageText,
-        message.gameDate,
-        message.createdAt,
-      );
-    return message;
+  addChatMessage(...args: Parameters<ChatRepository['addChatMessage']>): ChatMessage {
+    return this.chats.addChatMessage(...args);
   }
 
   commitTurn(
@@ -707,7 +778,7 @@ export class Repository {
     states: Map<string, NationState>,
     generatedEvents: GeneratedEvent[],
     lawChanges: GeneratedLawChange[] = [],
-    applyWorldChanges?: () => void,
+    applyWorldChanges?: (events: GameEvent[]) => void,
   ): GameEvent[] {
     const timestamp = now();
     const persistedEvents: GameEvent[] = generatedEvents.map((event) => ({
@@ -766,8 +837,9 @@ export class Repository {
       const insertEvent = this.database.prepare(
         `INSERT INTO events (
           id, game_id, title, description, event_type, severity, affected_nations,
-          state_changes, map_cue, game_date, created_at, turn_number
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          state_changes, map_cue, subtype, icon_key, strategic_effect,
+          game_date, created_at, turn_number
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       for (const event of persistedEvents) {
         insertEvent.run(
@@ -780,6 +852,9 @@ export class Repository {
           JSON.stringify(event.affected_nations),
           JSON.stringify(event.state_changes),
           JSON.stringify(event.map_cue),
+          event.subtype ?? 'general',
+          event.icon_key ?? `event-${event.event_type}`,
+          event.strategic_effect ? JSON.stringify(event.strategic_effect) : null,
           event.gameDate,
           event.createdAt,
           event.turnNumber,
@@ -819,13 +894,19 @@ export class Repository {
         }
       }
 
-      applyWorldChanges?.();
+      applyWorldChanges?.(persistedEvents);
 
       this.database
-        .prepare("UPDATE actions SET status = 'completed' WHERE game_id = ? AND status = 'pending'")
+        .prepare(
+          `UPDATE actions SET status = 'completed', effect_status = 'applied'
+           WHERE game_id = ? AND status = 'pending'`,
+        )
         .run(gameId);
       this.database
-        .prepare('UPDATE games SET current_date = ?, turn_number = ?, updated_at = ? WHERE id = ?')
+        .prepare(
+          `UPDATE games SET current_date = ?, turn_number = ?, world_revision = world_revision + 1,
+           updated_at = ? WHERE id = ?`,
+        )
         .run(nextDate, expectedTurn + 1, timestamp, gameId);
       this.database.exec('COMMIT');
     } catch (error) {
@@ -836,60 +917,15 @@ export class Repository {
   }
 
   getLlmSettings(editable: boolean): LlmSettingsPublic {
-    const row = this.database.prepare('SELECT * FROM llm_settings WHERE id = 1').get() as
-      Row | undefined;
-    if (!row) {
-      return {
-        provider: 'lm-studio',
-        apiUrl: 'http://127.0.0.1:1234/v1',
-        model: 'qwen/qwen3.5-9b',
-        hasApiKey: false,
-        editable,
-      };
-    }
-    return {
-      provider: asString(row.provider) as LlmSettingsPublic['provider'],
-      apiUrl: asString(row.api_url),
-      model: asString(row.model),
-      hasApiKey: asString(row.api_key).length > 0,
-      editable,
-    };
+    return this.llm.getLlmSettings(editable);
   }
 
   getLlmSettingsPrivate() {
-    const row = this.database.prepare('SELECT * FROM llm_settings WHERE id = 1').get() as
-      Row | undefined;
-    return row
-      ? {
-          provider: asString(row.provider) as LlmSettingsInput['provider'],
-          apiUrl: asString(row.api_url),
-          apiKey: asString(row.api_key),
-          model: asString(row.model),
-        }
-      : {
-          provider: 'lm-studio' as const,
-          apiUrl: 'http://127.0.0.1:1234/v1',
-          apiKey: '',
-          model: 'qwen/qwen3.5-9b',
-        };
+    return this.llm.getLlmSettingsPrivate();
   }
 
   saveLlmSettings(input: LlmSettingsInput) {
-    const existing = this.getLlmSettingsPrivate();
-    const apiKey = input.clearApiKey ? '' : (input.apiKey ?? existing.apiKey);
-    this.database
-      .prepare(
-        `INSERT INTO llm_settings (
-          id, provider, api_url, api_key, model, imported_legacy, updated_at
-        ) VALUES (1, ?, ?, ?, ?, 0, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          provider = excluded.provider,
-          api_url = excluded.api_url,
-          api_key = excluded.api_key,
-          model = excluded.model,
-          updated_at = excluded.updated_at`,
-      )
-      .run(input.provider, input.apiUrl, apiKey, input.model, now());
+    return this.llm.saveLlmSettings(input);
   }
 
   importLegacyLlmSettings(settings: {
@@ -898,151 +934,36 @@ export class Repository {
     apiKey: string;
     model: string;
   }) {
-    const count = this.database.prepare('SELECT COUNT(*) AS count FROM llm_settings').get() as Row;
-    if (asNumber(count.count) > 0) return false;
-    this.database
-      .prepare(
-        `INSERT INTO llm_settings (
-          id, provider, api_url, api_key, model, imported_legacy, updated_at
-        ) VALUES (1, ?, ?, ?, ?, 1, ?)`,
-      )
-      .run(settings.provider, settings.apiUrl, settings.apiKey, settings.model, now());
-    return true;
+    return this.llm.importLegacyLlmSettings(settings);
   }
 
-  createLlmCall(input: {
-    id: string;
-    gameId: string | null;
-    gameName: string | null;
-    requestId: string;
-    clientId: string;
-    type: LlmCallType;
-    provider: LlmProviderName;
-    model: string;
-  }): LlmCallRecord {
-    const startedAt = now();
-    this.database
-      .prepare(
-        `INSERT INTO llm_calls (
-          id, game_id, game_name, request_id, client_id, call_type, provider, model,
-          phase, status, started_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'preparing', 'running', ?)`,
-      )
-      .run(
-        input.id,
-        input.gameId,
-        input.gameName,
-        input.requestId,
-        input.clientId,
-        input.type,
-        input.provider,
-        input.model,
-        startedAt,
-      );
-    return this.getLlmCall(input.id);
+  createLlmCall(input: Parameters<LlmRepository['createLlmCall']>[0]) {
+    return this.llm.createLlmCall(input);
   }
 
-  updateLlmCallPhase(id: string, phase: LlmCallPhase): LlmCallRecord {
-    const result = this.database
-      .prepare("UPDATE llm_calls SET phase = ? WHERE id = ? AND status = 'running'")
-      .run(phase, id);
-    this.expectChange(result, 'LLM call');
-    return this.getLlmCall(id);
+  updateLlmCallPhase(id: string, phase: LlmCallPhase) {
+    return this.llm.updateLlmCallPhase(id, phase);
   }
 
-  completeLlmCall(id: string, usage: LlmTokenUsage | null): LlmCallRecord {
-    const completedAt = now();
-    const started = this.getLlmCall(id);
-    const durationMs = Math.max(0, Date.parse(completedAt) - Date.parse(started.startedAt));
-    const result = this.database
-      .prepare(
-        `UPDATE llm_calls
-         SET phase = 'applying_result', status = 'succeeded', completed_at = ?, duration_ms = ?,
-             input_tokens = ?, output_tokens = ?, total_tokens = ?, error_code = NULL
-         WHERE id = ? AND status = 'running'`,
-      )
-      .run(
-        completedAt,
-        durationMs,
-        usage?.inputTokens ?? null,
-        usage?.outputTokens ?? null,
-        usage?.totalTokens ?? null,
-        id,
-      );
-    this.expectChange(result, 'LLM call');
-    this.pruneLlmCalls();
-    return this.getLlmCall(id);
+  completeLlmCall(id: string, usage: LlmTokenUsage | null) {
+    return this.llm.completeLlmCall(id, usage);
   }
 
-  failLlmCall(id: string, errorCode: string): LlmCallRecord {
-    const completedAt = now();
-    const started = this.getLlmCall(id);
-    const durationMs = Math.max(0, Date.parse(completedAt) - Date.parse(started.startedAt));
-    const result = this.database
-      .prepare(
-        `UPDATE llm_calls
-         SET status = 'failed', completed_at = ?, duration_ms = ?, error_code = ?
-         WHERE id = ? AND status = 'running'`,
-      )
-      .run(completedAt, durationMs, errorCode, id);
-    this.expectChange(result, 'LLM call');
-    this.pruneLlmCalls();
-    return this.getLlmCall(id);
+  failLlmCall(id: string, errorCode: string) {
+    return this.llm.failLlmCall(id, errorCode);
   }
 
-  markInterruptedLlmCalls(): LlmCallRecord[] {
-    const running = this.database
-      .prepare("SELECT id FROM llm_calls WHERE status = 'running'")
-      .all() as Row[];
-    return running.map((row) => this.failLlmCall(asString(row.id), 'SERVER_RESTARTED'));
+  markInterruptedLlmCalls() {
+    return this.llm.markInterruptedLlmCalls();
   }
 
-  listLlmCalls(options: { gameId?: string; limit: number }): LlmCallRecord[] {
-    const gameFilter = options.gameId ? ' AND game_id = ?' : '';
-    const parameters = options.gameId ? [options.gameId] : [];
-    const active = this.database
-      .prepare(
-        `SELECT * FROM llm_calls
-         WHERE status = 'running'${gameFilter}
-         ORDER BY started_at DESC, rowid DESC`,
-      )
-      .all(...parameters) as Row[];
-    const completed = this.database
-      .prepare(
-        `SELECT * FROM llm_calls
-         WHERE status != 'running'${gameFilter}
-         ORDER BY completed_at DESC, rowid DESC
-         LIMIT ?`,
-      )
-      .all(...parameters, Math.min(100, Math.max(1, options.limit))) as Row[];
-    return [...active, ...completed].map(this.mapLlmCall);
-  }
-
-  private getLlmCall(id: string): LlmCallRecord {
-    const row = this.database.prepare('SELECT * FROM llm_calls WHERE id = ?').get(id) as
-      Row | undefined;
-    if (!row) throw notFound('LLM call');
-    return this.mapLlmCall(row);
-  }
-
-  private pruneLlmCalls() {
-    this.database
-      .prepare(
-        `DELETE FROM llm_calls
-         WHERE status != 'running'
-           AND id NOT IN (
-             SELECT id FROM llm_calls
-             WHERE status != 'running'
-             ORDER BY completed_at DESC, rowid DESC
-             LIMIT 100
-           )`,
-      )
-      .run();
+  listLlmCalls(options: Parameters<LlmRepository['listLlmCalls']>[0]) {
+    return this.llm.listLlmCalls(options);
   }
 
   private initializeCountryProfiles() {
     const games = this.database
-      .prepare('SELECT id, current_date FROM games ORDER BY created_at')
+      .prepare('SELECT id, games.current_date FROM games ORDER BY created_at')
       .all() as Row[];
     if (!games.length) return;
     this.database.exec('BEGIN IMMEDIATE');
@@ -1109,7 +1030,11 @@ export class Repository {
     }
   }
 
-  private seedHistoricalLaws(gameId: string, enactedDate: string) {
+  private seedHistoricalLaws(
+    gameId: string,
+    enactedDate: string,
+    baselines: ReadonlyMap<string, CountryBaseline> = this.catalog.countryBaselines,
+  ) {
     const existing = new Set(
       (
         this.database
@@ -1120,7 +1045,7 @@ export class Repository {
           .all(gameId) as Row[]
       ).map((row) => asString(row.nation_code)),
     );
-    for (const [nationCode, baseline] of this.catalog.countryBaselines) {
+    for (const [nationCode, baseline] of baselines) {
       if (existing.has(nationCode)) continue;
       for (const law of baseline.laws) {
         this.insertCountryLaw({
@@ -1227,20 +1152,106 @@ export class Repository {
     if (Number(result.changes) === 0) throw notFound(resource);
   }
 
+  private assertPreviewRevision(
+    gameId: string,
+    effects: WorldEffect[],
+    previewWorldRevision: number | null,
+  ) {
+    if (effects.length === 0) return;
+    const currentRevision = this.getWorldRevision(gameId);
+    if (previewWorldRevision === null || previewWorldRevision !== currentRevision) {
+      throw new AppError(
+        409,
+        'WORLD_REVISION_CONFLICT',
+        'The world changed after this action was previewed. Preview the effects again.',
+      );
+    }
+  }
+
+  private persistedNation(
+    gameId: string,
+    nationCode: string,
+    language: CatalogLanguage,
+  ): Nation | null {
+    const row = this.database
+      .prepare(
+        `SELECT gp.*, ns.population, ns.manpower,
+                COALESCE((
+                  SELECT holder_name FROM game_office_holders goh
+                  WHERE goh.game_id = gp.game_id AND goh.nation_code = gp.nation_code
+                  ORDER BY is_primary DESC, role LIMIT 1
+                ), '') AS leader_name,
+                COALESCE((
+                  SELECT CASE WHEN ? = 'fr' THEN title_fr ELSE title_en END
+                  FROM game_office_holders goh
+                  WHERE goh.game_id = gp.game_id AND goh.nation_code = gp.nation_code
+                  ORDER BY is_primary DESC, role LIMIT 1
+                ), '') AS leader_title
+         FROM game_polities gp
+         JOIN nation_states ns ON ns.game_id = gp.game_id AND ns.nation_code = gp.nation_code
+         WHERE gp.game_id = ? AND gp.nation_code = ?`,
+      )
+      .get(language, gameId, nationCode) as Row | undefined;
+    if (!row) return null;
+    return {
+      code: nationCode,
+      name: asString(language === 'fr' ? row.name_fr : row.name_en),
+      capital:
+        row.capital_en === null
+          ? undefined
+          : asString(language === 'fr' ? row.capital_fr : row.capital_en),
+      ideology: asString(row.ideology),
+      is_major_power: asBoolean(row.is_major_power),
+      color: asString(row.color),
+      population: asNumber(row.population),
+      manpower: asNumber(row.manpower),
+      military_strength: asBoolean(row.is_major_power) ? 75 : 35,
+      has_territory: true,
+      leader_name: asString(row.leader_name) || undefined,
+      leader_title: asString(row.leader_title) || undefined,
+    };
+  }
+
+  private listOfficeHolders(gameId: string, nationCode: string, language: CatalogLanguage) {
+    return (
+      this.database
+        .prepare(
+          `SELECT * FROM game_office_holders
+           WHERE game_id = ? AND nation_code = ? ORDER BY is_primary DESC, role`,
+        )
+        .all(gameId, nationCode) as Row[]
+    ).map((row) => ({
+      id: asString(row.holder_id),
+      nationCode: asString(row.nation_code),
+      role: asString(row.role) as 'head_of_state' | 'head_of_government',
+      title: asString(language === 'fr' ? row.title_fr : row.title_en),
+      name: asString(row.holder_name),
+      termStart: asString(row.term_start),
+      termEnd: row.term_end === null ? null : asString(row.term_end),
+      source: asString(row.source) as 'wikidata' | 'curated' | 'simulation',
+      primary: asBoolean(row.is_primary),
+    }));
+  }
+
   private mapGameSummary = (row: Row, language: CatalogLanguage = 'en'): GameSummary => {
     const playerNationCode = asString(row.player_nation_code);
-    const playerNation = this.catalog.nations.get(playerNationCode);
+    const playerNation =
+      this.persistedNation(asString(row.id), playerNationCode, language) ??
+      this.catalog.nations.get(playerNationCode);
     return {
       id: asString(row.id),
       name: asString(row.name),
       playerNationCode,
       playerNationName: playerNation
-        ? this.catalog.localizeNation(playerNation, language).name
+        ? asString(row.historical_baseline_mode) === 'historical_v1'
+          ? playerNation.name
+          : this.catalog.localizeNation(playerNation, language).name
         : playerNationCode,
       scenarioMode: asString(row.scenario_mode || 'historical') as ScenarioMode,
       difficulty: asString(row.difficulty || 'normal') as GameSummary['difficulty'],
       currentDate: asString(row.current_date),
       turnNumber: asNumber(row.turn_number),
+      worldRevision: asNumber(row.world_revision),
       createdAt: asString(row.created_at),
       updatedAt: asString(row.updated_at),
     };
@@ -1256,6 +1267,9 @@ export class Repository {
     aiResponse: row.ai_response === null ? null : asString(row.ai_response),
     turnNumber: asNumber(row.turn_number),
     createdAt: asString(row.created_at),
+    effects: parseJson<WorldEffect[]>(row.effects_json, []),
+    effectStatus: asString(row.effect_status || 'queued') as Action['effectStatus'],
+    previewWorldRevision: asNullableNumber(row.preview_world_revision),
   });
 
   private mapEvent = (row: Row): GameEvent => {
@@ -1282,6 +1296,16 @@ export class Repository {
                 camera: 'nation',
               }
             : { locations: [{ kind: 'global', role: 'primary' }], camera: 'world' },
+      subtype: asString(row.subtype || 'general'),
+      icon_key: asString(row.icon_key || `event-${asString(row.event_type)}`),
+      ...(row.strategic_effect
+        ? {
+            strategic_effect: parseJson<GameEvent['strategic_effect']>(
+              row.strategic_effect,
+              undefined,
+            ),
+          }
+        : {}),
       gameDate: asString(row.game_date),
       createdAt: asString(row.created_at),
       turnNumber: asNumber(row.turn_number),
@@ -1300,70 +1324,6 @@ export class Repository {
     organization: asNumber(row.organization),
     experience: asNumber(row.experience),
     createdAt: asString(row.created_at),
-  });
-
-  private mapChat = (row: Row): Chat => {
-    const targetNationCode = asString(row.target_nation_code);
-    const participantRows = this.database
-      .prepare(
-        'SELECT nation_code FROM chat_participants WHERE chat_id = ? ORDER BY sort_order, nation_code',
-      )
-      .all(asString(row.id)) as Row[];
-    const participantCodes = participantRows.length
-      ? participantRows.map((participant) => asString(participant.nation_code))
-      : [targetNationCode];
-    return {
-      id: asString(row.id),
-      gameId: asString(row.game_id),
-      targetNationCode,
-      targetNationName: this.catalog.nations.get(targetNationCode)?.name ?? targetNationCode,
-      participants: participantCodes.map((nationCode) => ({
-        nationCode,
-        nationName: this.catalog.nations.get(nationCode)?.name ?? nationCode,
-      })),
-      nextSpeakerNationCode:
-        row.next_speaker_nation_code === null || row.next_speaker_nation_code === undefined
-          ? null
-          : asString(row.next_speaker_nation_code),
-      status: asString(row.status) as Chat['status'],
-      createdAt: asString(row.created_at),
-    };
-  };
-
-  private mapChatMessage = (row: Row): ChatMessage => ({
-    id: asString(row.id),
-    chatId: asString(row.chat_id),
-    senderNation: asString(row.sender_nation),
-    senderName: asString(row.sender_name),
-    leaderName: asString(row.leader_name),
-    messageText: asString(row.message_text),
-    gameDate: asString(row.game_date),
-    createdAt: asString(row.created_at),
-  });
-
-  private mapLlmCall = (row: Row): LlmCallRecord => ({
-    id: asString(row.id),
-    gameId: row.game_id === null ? null : asString(row.game_id),
-    gameName: row.game_name === null ? null : asString(row.game_name),
-    requestId: asString(row.request_id),
-    clientId: asString(row.client_id),
-    type: asString(row.call_type) as LlmCallType,
-    provider: asString(row.provider) as LlmProviderName,
-    model: asString(row.model),
-    phase: asString(row.phase) as LlmCallPhase,
-    status: asString(row.status) as LlmCallStatus,
-    startedAt: asString(row.started_at),
-    completedAt: row.completed_at === null ? null : asString(row.completed_at),
-    durationMs: asNullableNumber(row.duration_ms),
-    usage:
-      row.input_tokens === null || row.output_tokens === null || row.total_tokens === null
-        ? null
-        : {
-            inputTokens: asNumber(row.input_tokens),
-            outputTokens: asNumber(row.output_tokens),
-            totalTokens: asNumber(row.total_tokens),
-          },
-    errorCode: row.error_code === null ? null : asString(row.error_code),
   });
 
   private mapGameAiModels(value: unknown): GameAiModels {
@@ -1389,19 +1349,144 @@ export class Repository {
     }
   }
 
-  private seedCampaignWorld(gameId: string, timestamp: string) {
+  private initializeDynamicCapitals() {
+    this.database.exec(`
+      UPDATE nation_states
+      SET capital_feature_id = (
+        SELECT map_features.id
+        FROM map_features
+        WHERE map_features.game_id = nation_states.game_id
+          AND map_features.nation_code = nation_states.nation_code
+          AND map_features.feature_type = 'capital'
+        ORDER BY map_features.created_at
+        LIMIT 1
+      )
+      WHERE capital_feature_id IS NULL;
+    `);
+  }
+
+  private seedHistoricalSnapshot(
+    gameId: string,
+    snapshot: HistoricalWorldSnapshot,
+    timestamp: string,
+  ) {
+    const english = this.historical.resolve(snapshot.date, 'en');
+    const french = this.historical.resolve(snapshot.date, 'fr');
+    const frenchByCode = new Map(french.polities.map((polity) => [polity.code, polity]));
+    const insertPolity = this.database.prepare(
+      `INSERT INTO game_polities (
+        game_id, nation_code, name_en, name_fr, capital_en, capital_fr, capital_region_id,
+        ideology, government_type, is_major_power, color, active_from, active_to,
+        data_quality, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    const insertOffice = this.database.prepare(
+      `INSERT INTO game_office_holders (
+        game_id, office_key, holder_id, nation_code, role, title_en, title_fr,
+        holder_name, term_start, term_end, source, is_primary, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    const insertContinuity = this.database.prepare(
+      `INSERT OR IGNORE INTO historical_continuity (
+        game_id, entity_type, entity_id, continuity_status, diverged_at, reason, updated_at
+      ) VALUES (?, ?, ?, 'historical', NULL, NULL, ?)`,
+    );
+    for (const polity of english.polities) {
+      const localized = frenchByCode.get(polity.code) ?? polity;
+      insertPolity.run(
+        gameId,
+        polity.code,
+        polity.name,
+        localized.name,
+        polity.capital,
+        localized.capital,
+        polity.capitalRegionId,
+        polity.ideology,
+        polity.governmentType,
+        polity.isMajorPower ? 1 : 0,
+        polity.color,
+        polity.activeFrom,
+        polity.activeTo,
+        polity.dataQuality,
+        timestamp,
+        timestamp,
+      );
+      insertContinuity.run(gameId, 'polity', polity.code, timestamp);
+      if (polity.capitalRegionId) {
+        insertContinuity.run(gameId, 'capital', polity.code, timestamp);
+        const feature = this.database
+          .prepare(
+            `SELECT id FROM map_features WHERE game_id = ? AND region_id = ?
+             ORDER BY feature_type = 'capital' DESC, rowid LIMIT 1`,
+          )
+          .get(gameId, polity.capitalRegionId) as Row | undefined;
+        if (feature) {
+          this.database
+            .prepare('UPDATE map_features SET nation_code = ? WHERE id = ? AND game_id = ?')
+            .run(polity.code, asString(feature.id), gameId);
+          this.database
+            .prepare(
+              `UPDATE nation_states SET capital_feature_id = ?, capital_status = 'established'
+               WHERE game_id = ? AND nation_code = ?`,
+            )
+            .run(asString(feature.id), gameId, polity.code);
+        }
+      }
+      const localizedOffices = new Map(
+        (localized.officeHolders ?? []).map((holder) => [holder.id, holder]),
+      );
+      for (const holder of polity.officeHolders) {
+        const localizedHolder = localizedOffices.get(holder.id) ?? holder;
+        const officeKey = `${polity.code}:${holder.role}`;
+        insertOffice.run(
+          gameId,
+          officeKey,
+          holder.id,
+          polity.code,
+          holder.role,
+          holder.title,
+          localizedHolder.title,
+          holder.name,
+          holder.termStart,
+          holder.termEnd,
+          holder.source,
+          holder.primary ? 1 : 0,
+          timestamp,
+        );
+        insertContinuity.run(gameId, 'office', officeKey, timestamp);
+      }
+    }
+    for (const regionId of snapshot.regionOwners.keys()) {
+      insertContinuity.run(gameId, 'region', regionId, timestamp);
+    }
+  }
+
+  private seedCampaignWorld(
+    gameId: string,
+    timestamp: string,
+    historicalOwners?: ReadonlyMap<string, string | null>,
+    historicalStatuses?: HistoricalWorldSnapshot['regionStatuses'],
+  ) {
     const insertRegion = this.database.prepare(
       `INSERT OR IGNORE INTO game_regions (
-        game_id, region_id, name, owner_nation_code, region_type, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?)`,
+        game_id, region_id, name, owner_nation_code, controller_nation_code,
+        claim_nation_codes, territorial_status, administering_nation_code,
+        region_type, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     for (const region of this.catalog.regions.regions) {
+      const owner = historicalOwners?.get(region.id) ?? region.nation_code ?? null;
+      const status = historicalStatuses?.get(region.id);
       insertRegion.run(
         gameId,
         region.id,
         region.name,
-        region.nation_code ?? null,
-        region.nation_code ? 'land' : 'ocean',
+        owner,
+        owner,
+        JSON.stringify(status?.claimNationCodes ?? []),
+        status?.status ?? null,
+        status?.administeringNationCode ?? null,
+        owner ? 'land' : 'ocean',
         timestamp,
       );
     }
@@ -1438,23 +1523,6 @@ export class Repository {
   }
 }
 
-export interface LlmCallRecord {
-  id: string;
-  gameId: string | null;
-  gameName: string | null;
-  requestId: string;
-  clientId: string;
-  type: LlmCallType;
-  provider: LlmProviderName;
-  model: string;
-  phase: LlmCallPhase;
-  status: LlmCallStatus;
-  startedAt: string;
-  completedAt: string | null;
-  durationMs: number | null;
-  usage: LlmTokenUsage | null;
-  errorCode: string | null;
-}
-
+export type { LlmCallRecord } from './llm-repository.js';
 export type RepositoryCatalog = Pick<Catalog, 'nations' | 'listNations'>;
 export type { Nation };

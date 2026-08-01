@@ -1,6 +1,6 @@
 import type { Response } from 'express';
 
-export type StreamEvent = 'turn.started' | 'turn.completed' | 'turn.failed';
+export type StreamEvent = 'turn.started' | 'turn.completed' | 'turn.failed' | 'world.changed';
 
 export class SseHub {
   private readonly clients = new Map<string, Set<Response>>();

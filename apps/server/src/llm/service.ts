@@ -5,6 +5,7 @@ import {
   type ChatMessage,
   type Game,
   type GameEvent,
+  type GameRegion,
   type GeneratedTurn,
   type LlmSettingsInput,
   type LlmTokenUsage,
@@ -17,20 +18,72 @@ import { prompts } from './prompts.js';
 import type { LlmActivityHandle } from './activity.js';
 import {
   createProvider,
+  assertLlmProviderAllowed,
+  structuredOutputModeFor,
   toPrivateSettings,
   type CompletionRequest,
   type CompletionResult,
 } from './providers.js';
+import {
+  actionValidationResponseSchema,
+  generatedTurnResponseSchemaFor,
+} from './response-schemas.js';
 
 const actionValidationSchema = z.object({
   accepted: z.boolean(),
   reason: z.string().max(500),
 });
 
+function projectRegions(regions: GameRegion[], actions: Action[]): GameRegion[] {
+  const projected = new Map(
+    regions.map((region) => [
+      region.regionId,
+      { ...region, claimNationCodes: [...region.claimNationCodes] },
+    ]),
+  );
+  for (const action of actions) {
+    for (const effect of action.effects) {
+      if (effect.kind !== 'territory') continue;
+      const region = projected.get(effect.regionId);
+      if (!region) continue;
+      const formerOwner = region.ownerNationCode;
+      if (effect.operation === 'cede') {
+        region.ownerNationCode = effect.nationCode;
+        region.controllerNationCode = effect.nationCode;
+        region.claimNationCodes = region.claimNationCodes.filter(
+          (code) => code !== formerOwner && code !== effect.nationCode,
+        );
+      } else if (effect.operation === 'annex') {
+        region.ownerNationCode = effect.nationCode;
+        region.controllerNationCode = effect.nationCode;
+        region.claimNationCodes = [
+          ...new Set([
+            ...region.claimNationCodes.filter((code) => code !== effect.nationCode),
+            ...(formerOwner && formerOwner !== effect.nationCode ? [formerOwner] : []),
+          ]),
+        ];
+      } else if (effect.operation === 'occupy') {
+        region.controllerNationCode = effect.nationCode;
+      } else if (effect.operation === 'liberate') {
+        region.controllerNationCode = region.ownerNationCode;
+      } else if (effect.operation === 'add_claim') {
+        region.claimNationCodes = [...new Set([...region.claimNationCodes, effect.nationCode])];
+      } else {
+        region.claimNationCodes = region.claimNationCodes.filter(
+          (code) => code !== effect.nationCode,
+        );
+      }
+    }
+  }
+  return [...projected.values()];
+}
+
 export type GenerationLanguage = 'fr' | 'en';
 export interface LlmResult<T> {
   value: T;
   usage: LlmTokenUsage | undefined;
+  schemaMode?: 'native_json_schema' | 'json_mode' | 'server_validation';
+  repairAttempts?: number;
 }
 
 const languageInstructions: Record<GenerationLanguage, string> = {
@@ -67,6 +120,18 @@ function extractJson(content: string): unknown {
   throw new AppError(502, 'LLM_INVALID_RESPONSE', 'The AI response was not valid JSON.');
 }
 
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function repairCandidates(initial: unknown, repaired: unknown) {
+  const candidates = [repaired];
+  if (isJsonObject(initial) && isJsonObject(repaired)) {
+    candidates.push({ ...initial, ...repaired });
+  }
+  return candidates;
+}
+
 function structuredIssues(error: unknown) {
   if (error instanceof ZodError) {
     return error.issues.map((issue) => ({
@@ -93,11 +158,16 @@ function mergeUsage(
   };
 }
 
+function firstStringColumn(rows: unknown[][]) {
+  return rows.flatMap((row) => (typeof row[0] === 'string' ? [row[0]] : []));
+}
+
 export class LlmService {
   constructor(
     private readonly repository: Repository,
     private readonly advanced: AdvancedRepository,
     private readonly timeoutMs: number,
+    private readonly allowFakeProvider: boolean,
   ) {}
 
   private settingsForGame(game: Game, mechanic: keyof Game['aiModels']) {
@@ -127,6 +197,7 @@ export class LlmService {
     activity: LlmActivityHandle,
     settings = this.repository.getLlmSettingsPrivate(),
   ): Promise<CompletionResult> {
+    assertLlmProviderAllowed(settings.provider, this.allowFakeProvider);
     activity.phase('waiting_provider');
     const result = await createProvider(settings, this.timeoutMs).complete(request);
     activity.phase('validating_response');
@@ -147,11 +218,15 @@ export class LlmService {
     activity: LlmActivityHandle,
     settings: ReturnType<Repository['getLlmSettingsPrivate']>,
     maxTokens: number,
+    responseSchema?: CompletionRequest['responseSchema'],
   ): Promise<LlmResult<T>> {
+    let initialValue: unknown;
     try {
+      initialValue = extractJson(initial.text);
       return {
-        value: schema.parse(extractJson(initial.text)),
+        value: schema.parse(initialValue),
         usage: initial.usage,
+        repairAttempts: 0,
       };
     } catch (error) {
       const issues = structuredIssues(error);
@@ -170,15 +245,14 @@ export class LlmService {
           maxTokens,
           temperature: 0,
           responseFormat: 'json',
+          ...(responseSchema ? { responseSchema } : {}),
         },
         activity,
         settings,
       );
+      let repairedValue: unknown;
       try {
-        return {
-          value: schema.parse(extractJson(repaired.text)),
-          usage: mergeUsage(initial.usage, repaired.usage),
-        };
+        repairedValue = extractJson(repaired.text);
       } catch (repairError) {
         const repairIssues = structuredIssues(repairError);
         if (!repairIssues) throw repairError;
@@ -189,6 +263,28 @@ export class LlmService {
           repairIssues,
         );
       }
+
+      let lastRepairError: unknown;
+      for (const candidate of repairCandidates(initialValue, repairedValue)) {
+        try {
+          return {
+            value: schema.parse(candidate),
+            usage: mergeUsage(initial.usage, repaired.usage),
+            repairAttempts: 1,
+          };
+        } catch (repairError) {
+          lastRepairError = repairError;
+        }
+      }
+
+      const repairIssues = structuredIssues(lastRepairError);
+      if (!repairIssues) throw lastRepairError;
+      throw new AppError(
+        502,
+        'INVALID_AI_RESPONSE',
+        'The AI response did not match the required simulation format after one repair attempt.',
+        repairIssues,
+      );
     }
   }
 
@@ -224,20 +320,29 @@ export class LlmService {
           maxTokens: 300,
           temperature: 0.2,
           responseFormat: 'json',
+          responseSchema: {
+            name: 'action_validation',
+            schema: actionValidationResponseSchema,
+          },
         }),
         language,
       ),
       activity,
       this.settingsForGame(game, 'actions'),
     );
-    return this.parseOrRepair(
+    const parsed = await this.parseOrRepair(
       result,
       actionValidationSchema,
       { accepted: true, reason: '1-500 chars' },
       activity,
       this.settingsForGame(game, 'actions'),
       300,
+      {
+        name: 'action_validation',
+        schema: actionValidationResponseSchema,
+      },
     );
+    return parsed;
   }
 
   async brainstorm(
@@ -334,6 +439,7 @@ export class LlmService {
     recentEvents: GameEvent[],
     activity: LlmActivityHandle,
     language: GenerationLanguage = 'fr',
+    characters: unknown[] = [],
   ): Promise<LlmResult<GeneratedTurn>> {
     const turnPrompt = prompts.turn(
       game,
@@ -343,33 +449,67 @@ export class LlmService {
       this.repository.listActiveLawsForSimulation(game.id),
       this.advanced.consolidationContext(game.id),
       {
-        regions: this.advanced.listRegions(game.id),
+        regions: projectRegions(this.advanced.listRegions(game.id), actions),
         features: this.advanced.listMapFeatures(game.id),
         units: this.repository.listUnits(game.id),
+        characters,
       },
     );
-    const expectedOutput = (JSON.parse(turnPrompt.user) as { output: unknown }).output;
+    const turnContext = JSON.parse(turnPrompt.user) as {
+      output: unknown;
+      worldState: {
+        regions: unknown[][];
+        features: unknown[][];
+        units: unknown[][];
+        characters: unknown[][];
+      };
+    };
+    const expectedOutput = turnContext.output;
+    const responseSchema = generatedTurnResponseSchemaFor({
+      nationCodes: game.nationStates.map((state) => state.nationCode),
+      regionIds: firstStringColumn(turnContext.worldState.regions),
+      featureIds: firstStringColumn(turnContext.worldState.features),
+      unitIds: firstStringColumn(turnContext.worldState.units),
+      characterIds: firstStringColumn(turnContext.worldState.characters),
+      lawIds: this.repository
+        .listActiveLawsForSimulation(game.id)
+        .filter((law) => law.nationCode === game.playerNation.code)
+        .slice(0, 20)
+        .map((law) => law.id),
+    });
     const settings = this.settingsForGame(game, 'turns');
     const result = await this.complete(
       this.localized(
         this.withPresetPrompt(game, 'turns', {
           ...turnPrompt,
-          maxTokens: 3_000,
+          maxTokens: 1_500,
           temperature: 0.3,
           responseFormat: 'json',
+          responseSchema: {
+            name: 'generated_turn',
+            schema: responseSchema,
+          },
         }),
         language,
       ),
       activity,
       settings,
     );
-    return this.parseOrRepair(
+    const parsed = await this.parseOrRepair(
       result,
       generatedTurnSchema,
       expectedOutput,
       activity,
       settings,
-      3_000,
+      1_500,
+      {
+        name: 'generated_turn',
+        schema: responseSchema,
+      },
     );
+    return {
+      ...parsed,
+      schemaMode: structuredOutputModeFor(settings),
+    };
   }
 }
