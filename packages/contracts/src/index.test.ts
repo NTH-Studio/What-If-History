@@ -4,6 +4,18 @@ import { createActionInputSchema, worldEffectSchema } from './index.js';
 const id = '10000000-0000-4000-8000-000000000001';
 
 describe('WorldEffect contract', () => {
+  it('defaults new actions to planned and accepts the explicit imposed mode', () => {
+    expect(createActionInputSchema.parse({ actionText: 'Préparer une réserve.' })).toMatchObject({
+      mode: 'planned',
+    });
+    expect(
+      createActionInputSchema.parse({
+        actionText: 'Le chef du gouvernement démissionne.',
+        mode: 'imposed',
+      }),
+    ).toMatchObject({ mode: 'imposed' });
+  });
+
   it.each([
     { kind: 'territory', operation: 'cede', regionId: 'Ile_de_France', nationCode: 'GER' },
     { kind: 'territory', operation: 'annex', regionId: 'Alsace', nationCode: 'GER' },
@@ -65,7 +77,7 @@ describe('WorldEffect contract', () => {
     expect(
       createActionInputSchema.safeParse({
         actionText: 'Ordre massif',
-        actionType: 'general',
+        mode: 'planned',
         effects: Array.from({ length: 101 }, () => ({
           kind: 'territory',
           operation: 'add_claim',

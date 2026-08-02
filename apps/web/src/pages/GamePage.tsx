@@ -20,7 +20,13 @@ import {
 import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Link, useHistory, useParams } from 'react-router-dom';
-import type { EventMapCue, GameEvent, Nation, TimelineEntry } from '@what-if-history/contracts';
+import {
+  uuidSchema,
+  type EventMapCue,
+  type GameEvent,
+  type Nation,
+  type TimelineEntry,
+} from '@what-if-history/contracts';
 import { api } from '../api';
 import { Preferences } from '../App';
 import { ConfirmDialog } from '../components/Dialogs';
@@ -41,6 +47,8 @@ import { Dashboard } from './game/Dashboard';
 import { DiplomacyPanel } from './game/DiplomacyPanel';
 import { EventsPanel } from './game/EventsPanel';
 import { EventTheater } from './game/EventTheater';
+import { eventPlaybackStorageKey, queueEventPlayback } from '../eventPlayback';
+import { formatCalendarDate } from '../dateFormatting';
 import styles from '../styles/App.module.css';
 
 const primarySections = [
@@ -102,9 +110,10 @@ export function GamePage() {
     section?: string;
     countryCode?: string;
   }>();
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const history = useHistory();
   const queryClient = useQueryClient();
+  const gameIdIsValid = uuidSchema.safeParse(gameId).success;
   const section: CampaignSection =
     routeSection === 'timeline'
       ? 'history'
@@ -128,28 +137,51 @@ export function GamePage() {
   const [manualFocusCue, setManualFocusCue] = useState<EventMapCue>();
   const [mapSelection, setMapSelection] = useState<MapSelection>();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
-  const game = useQuery({ queryKey: ['game', gameId], queryFn: () => api.game(gameId) });
-  const actions = useQuery({ queryKey: ['actions', gameId], queryFn: () => api.actions(gameId) });
-  const events = useQuery({ queryKey: ['events', gameId], queryFn: () => api.events(gameId) });
+  const game = useQuery({
+    queryKey: ['game', gameId],
+    queryFn: () => api.game(gameId),
+    enabled: gameIdIsValid,
+  });
+  const actions = useQuery({
+    queryKey: ['actions', gameId],
+    queryFn: () => api.actions(gameId),
+    enabled: gameIdIsValid,
+  });
+  const events = useQuery({
+    queryKey: ['events', gameId],
+    queryFn: () => api.events(gameId),
+    enabled: gameIdIsValid,
+  });
   const strategic = useQuery({
     queryKey: ['strategic-state', gameId],
     queryFn: () => api.strategicState(gameId),
+    enabled: gameIdIsValid,
   });
   const timeline = useQuery({
     queryKey: ['timeline', gameId],
     queryFn: () => api.timeline(gameId),
+    enabled: gameIdIsValid,
   });
   const worldHistory = useQuery({
     queryKey: ['world-history', gameId],
     queryFn: () => api.worldHistory(gameId),
-    enabled: section === 'events',
+    enabled: gameIdIsValid && section === 'events',
   });
-  const units = useQuery({ queryKey: ['units', gameId], queryFn: () => api.units(gameId) });
-  const chats = useQuery({ queryKey: ['chats', gameId], queryFn: () => api.chats(gameId) });
+  const units = useQuery({
+    queryKey: ['units', gameId],
+    queryFn: () => api.units(gameId),
+    enabled: gameIdIsValid,
+  });
+  const chats = useQuery({
+    queryKey: ['chats', gameId],
+    queryFn: () => api.chats(gameId),
+    enabled: gameIdIsValid,
+  });
   const nations = useQuery({ queryKey: ['nations'], queryFn: api.nations });
   const countries = useQuery({
     queryKey: ['countries', gameId],
     queryFn: () => api.countries(gameId),
+    enabled: gameIdIsValid,
   });
   const campaignMapNations = useMemo<Nation[]>(
     () =>
@@ -166,20 +198,23 @@ export function GamePage() {
       })),
     [countries.data],
   );
-  const playbackStorageKey = `what-if-history-event-playback:${gameId}`;
+  const playbackStorageKey = eventPlaybackStorageKey(gameId);
   const timelinePlaybackStorageKey = `what-if-history-timeline-playback:${gameId}`;
   const activePlaybackEvent = playbackEvents[playbackIndex];
   const activeTimelineEntry = playbackTimeline[timelinePlaybackIndex];
 
   useEffect(() => {
-    if (routeSection === 'timeline') {
+    if (!gameIdIsValid) {
+      history.replace('/');
+    } else if (routeSection === 'timeline') {
       history.replace(`/game/${gameId}/history`);
     } else if (!isCampaignSection(routeSection)) {
       history.replace(`/game/${gameId}/map`);
     }
-  }, [gameId, history, routeSection]);
+  }, [gameId, gameIdIsValid, history, routeSection]);
 
   useEffect(() => {
+    if (!gameIdIsValid) return;
     const stream = new EventSource(`/api/v1/stream?gameId=${encodeURIComponent(gameId)}`);
     const refresh = () => {
       void Promise.all([
@@ -202,7 +237,7 @@ export function GamePage() {
     stream.addEventListener('turn.completed', refresh);
     stream.addEventListener('world.changed', refresh);
     return () => stream.close();
-  }, [gameId, queryClient]);
+  }, [gameId, gameIdIsValid, queryClient]);
 
   useEffect(() => {
     if (!events.data || playbackEvents.length) return;
@@ -283,10 +318,7 @@ export function GamePage() {
     if (!nextEvents.length) return;
     setPlaybackEvents(nextEvents);
     setPlaybackIndex(0);
-    localStorage.setItem(
-      playbackStorageKey,
-      JSON.stringify({ eventIds: nextEvents.map((event) => event.id), index: 0 }),
-    );
+    queueEventPlayback(gameId, nextEvents);
   };
   const startTimelinePlayback = (entries: TimelineEntry[]) => {
     if (!entries.length) return;
@@ -333,7 +365,8 @@ export function GamePage() {
             </span>
           </strong>
           <span>
-            {game.data.currentDate} · {t('game.turn', { turn: game.data.turnNumber })}
+            {formatCalendarDate(game.data.currentDate, i18n.language, 'medium')} ·{' '}
+            {t('game.turn', { turn: game.data.turnNumber })}
           </span>
         </div>
         <button
@@ -623,6 +656,7 @@ export function GamePage() {
 
         {activePlaybackEvent && !activeTimelineEntry ? (
           <EventTheater
+            key={activePlaybackEvent.id}
             gameId={gameId}
             event={activePlaybackEvent}
             index={playbackIndex}

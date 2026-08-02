@@ -1,4 +1,25 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type Locator } from '@playwright/test';
+
+async function expectWindowContained(window: Locator) {
+  await expect(window).toBeVisible();
+  const metrics = await window.evaluate((element) => {
+    const bounds = element.getBoundingClientRect();
+    return {
+      bottom: bounds.bottom,
+      horizontalOverflow: element.scrollWidth > element.clientWidth + 2,
+      left: bounds.left,
+      right: bounds.right,
+      top: bounds.top,
+      viewportHeight: innerHeight,
+      viewportWidth: innerWidth,
+    };
+  });
+  expect(metrics.left).toBeGreaterThanOrEqual(0);
+  expect(metrics.top).toBeGreaterThanOrEqual(0);
+  expect(metrics.right).toBeLessThanOrEqual(metrics.viewportWidth);
+  expect(metrics.bottom).toBeLessThanOrEqual(metrics.viewportHeight);
+  expect(metrics.horizontalOverflow).toBe(false);
+}
 
 test('serves a supported permissions policy without browser console warnings', async ({ page }) => {
   const policyWarnings: string[] = [];
@@ -14,6 +35,41 @@ test('serves a supported permissions policy without browser console warnings', a
   );
   await page.reload();
   expect(policyWarnings).toEqual([]);
+});
+
+test('returns a real 404 for obsolete assets and never caches the application shell', async ({
+  request,
+}) => {
+  const missingAsset = await request.get('/assets/obsolete-build.css');
+  expect(missingAsset.status()).toBe(404);
+  expect(missingAsset.headers()['content-type']).toContain('text/plain');
+  expect(await missingAsset.text()).toContain('Reload the application');
+
+  const applicationRoute = await request.get('/game/00000000-0000-4000-8000-000000000001/map');
+  expect(applicationRoute.status()).toBe(200);
+  expect(applicationRoute.headers()['content-type']).toContain('text/html');
+  expect(applicationRoute.headers()['cache-control']).toBe('no-store');
+});
+
+test('redirects a malformed campaign URL without requesting undefined resources', async ({
+  page,
+}) => {
+  const malformedRequests: string[] = [];
+  const consoleErrors: string[] = [];
+  page.on('request', (request) => {
+    if (/\/api\/v1\/(?:games|stream).*undefined/.test(request.url())) {
+      malformedRequests.push(request.url());
+    }
+  });
+  page.on('console', (message) => {
+    if (message.type() === 'error') consoleErrors.push(message.text());
+  });
+
+  await page.goto('/game/undefined/dashboard');
+  await expect(page).toHaveURL(/\/$/);
+  await expect(page.getByRole('heading', { name: 'What If: History' })).toBeVisible();
+  expect(malformedRequests).toEqual([]);
+  expect(consoleErrors).toEqual([]);
 });
 
 test('shows the new identity and persists every display family', async ({ page }, testInfo) => {
@@ -95,6 +151,83 @@ test('shows the new identity and persists every display family', async ({ page }
   await expect(page.locator('html')).toHaveAttribute('data-mobile-navigation', 'bottom');
 });
 
+test('keeps every home window contained and localizes dates with the selected language', async ({
+  page,
+  request,
+}) => {
+  const gameResponse = await request.post('/api/v1/games', {
+    data: { nationCode: 'FRA', startDate: '1936-02-01', name: 'Fenêtres et dates E2E' },
+  });
+  expect(gameResponse.ok()).toBe(true);
+  const game = (await gameResponse.json()) as { id: string };
+  const consoleErrors: string[] = [];
+  page.on('console', (message) => {
+    if (message.type() === 'error') consoleErrors.push(message.text());
+  });
+
+  try {
+    await page.goto('/');
+    await expect(page.getByText('1 février 1936', { exact: true })).toBeVisible();
+
+    await page.getByRole('button', { name: 'Apparence et affichage' }).click();
+    const appearance = page.getByRole('dialog', { name: 'Apparence et affichage' });
+    await expectWindowContained(appearance);
+    await appearance.getByRole('button', { name: 'Fermer' }).click();
+
+    await page.getByRole('button', { name: 'Configuration IA' }).click();
+    const settings = page.getByRole('dialog', { name: 'Configuration IA' });
+    await expectWindowContained(settings);
+    await settings.getByRole('button', { name: 'Fermer' }).click();
+
+    await page.getByRole('button', { name: 'Nouvelle campagne' }).click();
+    const newGame = page.getByRole('dialog', { name: 'Nouvelle campagne' });
+    await expectWindowContained(newGame);
+    await expect(newGame.getByRole('textbox', { name: /Date de d/ })).toHaveAttribute('lang', 'fr');
+    await newGame.getByRole('button', { name: 'Fermer' }).click();
+
+    await page.getByRole('button', { name: 'Nouveau scénario' }).click();
+    const newPreset = page.getByRole('dialog', { name: 'Créer un scénario' });
+    await expectWindowContained(newPreset);
+    await expect(newPreset.getByLabel('Date de départ')).toHaveAttribute('lang', 'fr');
+    await newPreset.getByRole('button', { name: 'Fermer' }).click();
+
+    await page.getByRole('button', { name: 'Ouvrir le suivi de l’activité IA' }).click();
+    const activity = page.getByRole('dialog', { name: 'Activité IA' });
+    await expectWindowContained(activity);
+    await activity.getByRole('button', { name: 'Fermer' }).click();
+
+    const campaign = page.getByRole('article').filter({ hasText: 'Fenêtres et dates E2E' });
+    await campaign.getByRole('button', { name: 'Supprimer' }).click();
+    const confirmation = page.getByRole('alertdialog', {
+      name: /Supprimer cette campagne/,
+    });
+    await expectWindowContained(confirmation);
+    await confirmation.getByRole('button', { name: 'Annuler' }).click();
+
+    await page.getByRole('button', { name: 'Apparence et affichage' }).click();
+    await page.getByRole('dialog').getByRole('button', { name: 'English' }).click();
+    await page.getByRole('button', { name: 'Close' }).click();
+    await expect(page.getByText('February 1, 1936', { exact: true })).toBeVisible();
+    await expect(page.getByText('1936-02-01', { exact: true })).toHaveCount(0);
+
+    await page.getByRole('button', { name: 'New campaign' }).click();
+    const englishNewGame = page.getByRole('dialog', { name: 'New campaign' });
+    await expectWindowContained(englishNewGame);
+    await expect(englishNewGame.getByRole('textbox', { name: 'Start date' })).toHaveAttribute(
+      'lang',
+      'en',
+    );
+    await englishNewGame.getByRole('button', { name: 'Close' }).click();
+
+    await page.goto(`/game/${game.id}/dashboard`);
+    await expect(page.getByText('SITREP · Feb 1, 1936', { exact: true })).toBeVisible();
+    await expect(page.getByText('1936-02-01', { exact: true })).toHaveCount(0);
+    expect(consoleErrors).toEqual([]);
+  } finally {
+    await request.delete(`/api/v1/games/${game.id}`, { maxRetries: 2 });
+  }
+});
+
 test('tests saved AI settings without requiring the API key again', async ({ page, request }) => {
   await request.patch('/api/v1/llm/settings', {
     data: {
@@ -136,7 +269,31 @@ test('tests saved AI settings without requiring the API key again', async ({ pag
   expect(submittedSettings).not.toHaveProperty('apiKey');
 });
 
-test('creates and opens a campaign without native dialogs', async ({ page }, testInfo) => {
+test('creates and opens a campaign without native dialogs', async ({ page, request }, testInfo) => {
+  const consoleErrors: string[] = [];
+  const historicalWorldDates: string[] = [];
+  page.on('console', (message) => {
+    if (message.type() === 'error') consoleErrors.push(message.text());
+  });
+  page.on('request', (request) => {
+    const url = new URL(request.url());
+    if (url.pathname === '/api/v1/catalog/historical-world') {
+      historicalWorldDates.push(url.searchParams.get('date') ?? '');
+    }
+  });
+  await request.patch('/api/v1/llm/settings', {
+    data: {
+      provider: 'fake',
+      apiUrl: 'http://127.0.0.1:9/v1',
+      model: 'deterministic-opening-e2e',
+      apiKey: '',
+      clearApiKey: true,
+    },
+  });
+  await page.route('**/api/v1/games/start', async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await route.fulfill({ response: await route.fetch() });
+  });
   await page.goto('/');
   await expect(page.getByRole('heading', { name: 'What If: History' })).toBeVisible();
   await page.getByRole('button', { name: 'Nouvelle campagne' }).click();
@@ -153,6 +310,11 @@ test('creates and opens a campaign without native dialogs', async ({ page }, tes
     expect(mobileCampaignDialog.heightRatio).toBeLessThanOrEqual(0.89);
     expect(mobileCampaignDialog.right).toBeLessThanOrEqual(mobileCampaignDialog.viewportWidth - 7);
   }
+  const startDate = dialog.getByRole('textbox', { name: /Date de d/ });
+  await startDate.fill('0002-01-01');
+  await expect(dialog.getByText(/hors de la chronologie document/)).toBeVisible();
+  await expect(dialog.getByRole('button', { name: 'Lancer la campagne' })).toBeDisabled();
+  await startDate.fill('1936-01-01');
   const nation = page.getByRole('combobox', { name: 'Nation' });
   await nation.fill('fra');
   await expect(page.getByRole('option', { name: /FRA$/ })).toBeVisible();
@@ -160,15 +322,54 @@ test('creates and opens a campaign without native dialogs', async ({ page }, tes
   await nation.press('Enter');
   await expect(nation).toHaveValue(/FRA$/);
   await page.getByRole('button', { name: 'Lancer la campagne' }).click();
-  await expect(page.getByRole('heading', { name: 'Vue stratégique' })).toBeVisible({
-    timeout: 15_000,
-  });
+  await expect(page.getByRole('button', { name: 'L’IA simule le premier jour…' })).toBeDisabled();
+  await expect(page).toHaveURL(/\/game\/[0-9a-f-]+\/map$/, { timeout: 15_000 });
+  const openingTheater = page.getByTestId('event-theater');
+  await expect(openingTheater).toBeVisible();
+  await expect(openingTheater.getByText('Événement 1 sur 1')).toBeVisible();
+  await expect(
+    openingTheater.getByRole('heading', { name: 'Situation stratégique actualisée' }),
+  ).toBeVisible();
+  expect(
+    await openingTheater.evaluate((element) => getComputedStyle(element).animationName),
+  ).toContain('eventTheaterEnter');
+  const theaterBounds = await openingTheater.boundingBox();
+  const viewport = page.viewportSize();
+  expect(theaterBounds?.x).toBeGreaterThanOrEqual(0);
+  expect(theaterBounds?.y).toBeGreaterThanOrEqual(0);
+  expect((theaterBounds?.x ?? 0) + (theaterBounds?.width ?? 0)).toBeLessThanOrEqual(
+    viewport?.width ?? 0,
+  );
+  expect((theaterBounds?.y ?? 0) + (theaterBounds?.height ?? 0)).toBeLessThanOrEqual(
+    viewport?.height ?? 0,
+  );
+  await expect(openingTheater.getByText('2 janvier 1936', { exact: true })).toBeVisible();
+  if (testInfo.project.name === 'desktop') {
+    await expect(page.getByText('2 janv. 1936 · Tour 2')).toBeVisible();
+  } else {
+    await expect(page.getByText('2 janv. 1936 · Tour 2')).toBeHidden();
+  }
+  await openingTheater.getByRole('button', { name: 'Terminer' }).click();
+  await expect(openingTheater).toHaveCount(0);
+  expect(historicalWorldDates.every((date) => date >= '1870-01-01' && date <= '2026-07-31')).toBe(
+    true,
+  );
+  expect(consoleErrors).toEqual([]);
 });
 
 test('dates leaders, playable nations and the strategic map at campaign creation', async ({
   page,
   request,
 }) => {
+  await request.patch('/api/v1/llm/settings', {
+    data: {
+      provider: 'fake',
+      apiUrl: 'http://127.0.0.1:9/v1',
+      model: 'deterministic-dated-opening-e2e',
+      apiKey: '',
+      clearApiKey: true,
+    },
+  });
   const consoleErrors: string[] = [];
   page.on('console', (message) => {
     if (message.type() === 'error') consoleErrors.push(message.text());
@@ -197,14 +398,17 @@ test('dates leaders, playable nations and the strategic map at campaign creation
   await expect(dialog.getByText(/r.gions strat.giques du jeu/i)).toBeVisible();
 
   await dialog.getByRole('button', { name: 'Lancer la campagne' }).click();
-  await expect(page.getByRole('heading', { name: /Vue strat/ })).toBeVisible();
+  await expect(page).toHaveURL(/\/game\/[0-9a-f-]+\/map$/);
+  await expect(page.getByTestId('event-theater')).toBeVisible();
   const gameId = new URL(page.url()).pathname.split('/')[2]!;
+
+  await page.getByTestId('event-theater').getByRole('button', { name: 'Terminer' }).click();
 
   const profile = await request.get(`/api/v1/games/${gameId}/countries/FRA`);
   expect(profile.ok()).toBe(true);
   expect(await profile.json()).toMatchObject({
     leaderName: 'Jacques Chirac',
-    baselineDate: '2000-01-01',
+    baselineDate: '2000-01-02',
     officeHolders: [
       expect.objectContaining({ name: 'Jacques Chirac', role: 'head_of_state' }),
       expect.objectContaining({ name: 'Lionel Jospin', role: 'head_of_government' }),
@@ -248,10 +452,14 @@ test('creates, displays and simulates a persistent custom scenario', async ({ pa
   await expect(page.getByLabel('Prémisse du scénario')).toHaveValue(premise);
 
   await page.getByRole('button', { name: 'Lancer la campagne' }).click();
+  await expect(page).toHaveURL(/\/game\/[0-9a-f-]+\/map$/);
+  await expect(page.getByTestId('event-theater')).toBeVisible();
+  await page.getByTestId('event-theater').getByRole('button', { name: 'Terminer' }).click();
+  const gameId = new URL(page.url()).pathname.split('/')[2];
+  await page.goto(`/game/${gameId}/dashboard`);
   await expect(page.getByText('Briefing du scénario')).toBeVisible();
   await expect(page.getByText(premise)).toBeVisible();
 
-  const gameId = new URL(page.url()).pathname.split('/')[2];
   await page.getByRole('button', { name: 'Apparence et affichage' }).click();
   await page.getByRole('dialog').getByRole('button', { name: 'English' }).click();
   await page.getByRole('button', { name: 'Close' }).click();
@@ -268,57 +476,134 @@ test('creates, displays and simulates a persistent custom scenario', async ({ pa
   await page.getByRole('button', { name: 'Lancer la simulation' }).click();
   await expect
     .poll(async () => {
-      const response = await request.get(`/api/v1/games/${gameId}`);
+      const response = await request.get(`/api/v1/games/${gameId}`, { maxRetries: 2 });
       return ((await response.json()) as { turnNumber: number }).turnNumber;
     })
-    .toBe(2);
+    .toBe(3);
 
   const stored = await request.get(`/api/v1/games/${gameId}`);
   expect(stored.ok()).toBe(true);
   expect(await stored.json()).toMatchObject({
     scenarioMode: 'custom',
     worldContext: premise,
-    turnNumber: 2,
+    turnNumber: 3,
   });
   await request.delete(`/api/v1/games/${gameId}`, { maxRetries: 2 });
 });
 
-test('promulgates a law without a vote from the actions screen', async ({ page, request }) => {
+test('plans and imposes generic actions without a type or creation confirmation', async ({
+  page,
+  request,
+}) => {
   const gameResponse = await request.post('/api/v1/games', {
     data: {
       nationCode: 'FRA',
       startDate: '1936-01-01',
-      name: 'Promulgation E2E',
+      name: 'Actions planifiées et imposées E2E',
     },
   });
   expect(gameResponse.ok()).toBe(true);
   const game = (await gameResponse.json()) as { id: string };
 
-  await page.goto(`/game/${game.id}/actions`);
-  await page
-    .getByPlaceholder('Ex. Renforcer les défenses de la frontière orientale…')
-    .fill('Rendre la vaccination obligatoire.');
-  await page.getByRole('button', { name: 'Promulguer sans vote' }).click();
-  const confirmation = page.getByRole('alertdialog', {
-    name: 'Promulguer cette loi sans vote ?',
-  });
-  await expect(confirmation).toBeVisible();
-  await confirmation.getByRole('button', { name: 'Promulguer la loi' }).click();
+  try {
+    await page.goto(`/game/${game.id}/actions`);
+    const drawer = page.locator('aside[data-section="actions"]');
+    const composer = page.getByPlaceholder('Ex. Renforcer les défenses de la frontière orientale…');
 
-  await expect(page.getByText('Rendre la vaccination obligatoire.')).toBeVisible();
-  await expect(page.getByText('Promulguée · effet au prochain tour')).toBeVisible();
-  await expect(page.getByText('Loi', { exact: true })).toBeVisible();
+    await expect(drawer.getByLabel('Type')).toHaveCount(0);
+    await expect(drawer.getByText(/Promulguer|Soumettre/)).toHaveCount(0);
+    await expect(drawer.getByRole('button', { name: 'Planifier' })).toBeVisible();
+    await expect(drawer.getByRole('button', { name: 'Imposer' })).toBeVisible();
+    await expect(
+      drawer.getByText('La simulation décidera de la réussite et des conséquences.'),
+    ).toBeVisible();
+    await expect(
+      drawer.getByText('Ce fait sera garanti ; seules ses conséquences seront simulées.'),
+    ).toBeVisible();
 
-  const actionsResponse = await request.get(`/api/v1/games/${game.id}/actions`);
-  expect(actionsResponse.ok()).toBe(true);
-  expect(await actionsResponse.json()).toContainEqual(
-    expect.objectContaining({
-      actionType: 'law',
-      status: 'pending',
-      actionText: 'Rendre la vaccination obligatoire.',
-    }),
-  );
-  await request.delete(`/api/v1/games/${game.id}`, { maxRetries: 2 });
+    await composer.fill('Macron meurt étouffé par un os de poulet.');
+    await drawer.getByRole('button', { name: 'Imposer' }).click();
+    await expect(page.getByRole('alertdialog')).toHaveCount(0);
+
+    const imposedCard = drawer
+      .locator('article')
+      .filter({ hasText: 'Macron meurt étouffé par un os de poulet.' });
+    await expect(imposedCard.getByText('Imposé · garanti au prochain tour')).toBeVisible();
+    const actionsResponse = await request.get(`/api/v1/games/${game.id}/actions`);
+    expect(actionsResponse.ok()).toBe(true);
+    expect(await actionsResponse.json()).toContainEqual(
+      expect.objectContaining({
+        actionType: 'general',
+        mode: 'imposed',
+        status: 'pending',
+        effects: [],
+        actionText: 'Macron meurt étouffé par un os de poulet.',
+      }),
+    );
+
+    await imposedCard.getByRole('button', { name: 'Modifier' }).click();
+    const editDialog = page.getByRole('dialog', { name: 'Modifier l’ordre' });
+    await editDialog.getByLabel('Traitement').selectOption('planned');
+    await editDialog.getByLabel('Ordre').fill('Préparer une conférence diplomatique.');
+    await editDialog.getByRole('button', { name: 'Enregistrer' }).click();
+    const editedCard = drawer
+      .locator('article')
+      .filter({ hasText: 'Préparer une conférence diplomatique.' });
+    await expect(editedCard.getByText('Planifié · arbitrage au prochain tour')).toBeVisible();
+
+    let releasePreview = () => {};
+    const previewGate = new Promise<void>((resolve) => {
+      releasePreview = resolve;
+    });
+    await page.route('**/actions/preview', async (route) => {
+      await previewGate;
+      await route.continue();
+    });
+    await composer.fill('Renforcer les défenses de la frontière orientale.');
+    const planButton = drawer.getByRole('button', { name: 'Planifier' });
+    await planButton.click();
+    await expect(planButton).toBeDisabled();
+    releasePreview();
+    const plannedCard = drawer
+      .locator('article')
+      .filter({ hasText: 'Renforcer les défenses de la frontière orientale.' });
+    await expect(plannedCard.getByText('Planifié · arbitrage au prochain tour')).toBeVisible();
+    await page.unroute('**/actions/preview');
+
+    await plannedCard.getByRole('button', { name: 'Supprimer' }).click();
+    const deleteDialog = page.getByRole('alertdialog', { name: 'Supprimer' });
+    await expect(deleteDialog).toContainText(
+      'Cet ordre en attente sera supprimé de la prochaine simulation.',
+    );
+    await deleteDialog.getByRole('button', { name: 'Supprimer' }).click();
+    await expect(plannedCard).toHaveCount(0);
+
+    await page.route('**/actions/preview', async (route) => {
+      await route.fulfill({
+        status: 500,
+        contentType: 'application/problem+json',
+        body: JSON.stringify({ title: 'Preview unavailable' }),
+      });
+    });
+    await composer.fill('Tester l’état d’erreur.');
+    await planButton.click();
+    await expect(drawer.getByRole('alert')).toBeVisible();
+    await page.unroute('**/actions/preview');
+
+    await page.evaluate(() => localStorage.setItem('what-if-history-language', 'en'));
+    await page.reload();
+    await expect(page.getByRole('button', { name: 'Plan' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Impose' })).toBeVisible();
+    await expect(
+      page.getByText('The simulation will decide its success and consequences.'),
+    ).toBeVisible();
+    await expect(
+      page.getByText('This fact is guaranteed; only its consequences will be simulated.'),
+    ).toBeVisible();
+    await expect(page.getByLabel('Type')).toHaveCount(0);
+  } finally {
+    await request.delete(`/api/v1/games/${game.id}`, { maxRetries: 2 });
+  }
 });
 
 test('previews and paints the guaranteed Paris cession without a page reload', async ({
@@ -350,9 +635,9 @@ test('previews and paints the guaranteed Paris cession without a page reload', a
     await page
       .getByPlaceholder('Ex. Renforcer les défenses de la frontière orientale…')
       .fill("donner Paris à l'Allemagne");
-    await page.getByRole('button', { name: 'Prévisualiser les effets' }).click();
+    await page.getByRole('button', { name: 'Vérifier l’interprétation' }).click();
     await expect(page.getByText('Cession · Ile_de_France → GER')).toBeVisible();
-    await page.getByRole('button', { name: 'Soumettre à validation' }).click();
+    await page.getByRole('button', { name: 'Imposer' }).click();
     await expect(page.getByText("donner Paris à l'Allemagne")).toBeVisible();
 
     await page.goto(`/game/${game.id}/map`);
@@ -385,9 +670,15 @@ test('previews and paints the guaranteed Paris cession without a page reload', a
 
     await expect(page.getByRole('dialog', { name: 'Bilan du tour' })).toHaveCount(0);
     await page.goto(`/game/${game.id}/events`);
-    const turnDetails = page.locator('details').filter({ hasText: 'Détails du tour' });
+    const journal = page.locator('[data-section="events"]');
+    await journal.getByRole('tab', { name: /Opérations/ }).click();
+    const operationWithChanges = journal.locator(
+      '[data-journal-entry="operation"][data-has-changes="true"]',
+    );
+    expect(await operationWithChanges.count()).toBeGreaterThan(0);
+    await operationWithChanges.first().click();
+    const turnDetails = journal.getByRole('region', { name: 'Détails du tour' });
     await expect(turnDetails).toBeVisible();
-    await turnDetails.locator('summary').click();
     await expect(turnDetails.getByText('Décisions du joueur')).toBeVisible();
     await expect(turnDetails.getByText('Territoire · Ile de France')).toBeVisible();
     await expect(turnDetails.getByText('Capitale · FRA')).toBeVisible();
@@ -523,10 +814,13 @@ test('explores, compares and evolves complete country profiles', async ({ page, 
   await expect(comparison).toBeVisible();
   await expect(comparison.getByText('Reich allemand')).toBeVisible();
 
-  const lawResponse = await request.post(`/api/v1/games/${game.id}/actions/promulgate-law`, {
-    data: { actionText: 'Garantir un salaire minimum national.' },
+  const imposedResponse = await request.post(`/api/v1/games/${game.id}/actions`, {
+    data: {
+      actionText: 'Garantir un salaire minimum national.',
+      mode: 'imposed',
+    },
   });
-  expect(lawResponse.ok()).toBe(true);
+  expect(imposedResponse.ok()).toBe(true);
   await page.reload();
   await page.getByRole('button', { name: 'Lois' }).click();
   await expect(page.getByText('Garantir un salaire minimum national.')).toHaveCount(0);
@@ -540,7 +834,7 @@ test('explores, compares and evolves complete country profiles', async ({ page, 
   expect(after.indicators.gdp).toBeGreaterThan(before.indicators.gdp);
   await page.reload();
   await page.getByRole('button', { name: 'Lois' }).click();
-  await expect(page.getByText('Garantir un salaire minimum national.')).toBeVisible();
+  await expect(page.getByText('Garantir un salaire minimum national.')).toHaveCount(0);
 
   await page.goto(`/game/${game.id}/map`);
   const franceRegions = page.locator('path[data-owner-code="FRA"]');
@@ -617,6 +911,15 @@ test('mobile navigation and event theater remain usable', async ({ page, request
 
 test('authors, publishes and launches a reusable scenario', async ({ page, request }, testInfo) => {
   test.skip(testInfo.project.name !== 'desktop');
+  await request.patch('/api/v1/llm/settings', {
+    data: {
+      provider: 'fake',
+      apiUrl: 'http://127.0.0.1:9/v1',
+      model: 'deterministic-preset-opening-e2e',
+      apiKey: '',
+      clearApiKey: true,
+    },
+  });
   const presetResponse = await request.post('/api/v1/presets', {
     data: {
       title: 'Brumes continentales E2E',
@@ -653,13 +956,21 @@ test('authors, publishes and launches a reusable scenario', async ({ page, reque
   const launchDialog = page.getByRole('dialog', { name: 'Lancer ce scénario' });
   await launchDialog.getByRole('combobox', { name: 'Nation' }).selectOption('GER');
   await launchDialog.getByRole('button', { name: 'Jouer' }).click();
-  await expect(page.getByRole('heading', { name: 'Vue stratégique' })).toBeVisible();
+  await expect(page).toHaveURL(new RegExp(`/game/[0-9a-f-]+/map$`));
+  const presetOpeningTheater = page.getByTestId('event-theater');
+  await expect(presetOpeningTheater).toBeVisible();
+  await expect(
+    presetOpeningTheater.getByRole('heading', { name: 'Situation stratégique actualisée' }),
+  ).toBeVisible();
+  await presetOpeningTheater.getByRole('button', { name: 'Terminer' }).click();
 
   const gameId = new URL(page.url()).pathname.split('/')[2];
   const game = await request.get(`/api/v1/games/${gameId}`);
   expect(await game.json()).toMatchObject({
     presetId: preset.id,
-    currentDate: '1889-04-01',
+    currentDate: '1889-04-02',
+    turnNumber: 2,
+    eventCount: 1,
     difficulty: 'hard',
     playerNationCode: 'GER',
   });
@@ -1094,7 +1405,7 @@ test('declutters coincident Paris markers by layer and offers an accessible grou
   }
 });
 
-test('keeps zoom and layer controls in the bottom-right, grouped and clear of map intel', async ({
+test('keeps zoom and layer controls pinned to the left, grouped and clear of map intel', async ({
   page,
   request,
 }, testInfo) => {
@@ -1126,7 +1437,7 @@ test('keeps zoom and layer controls in the bottom-right, grouped and clear of ma
     await expect(claims).toBeVisible();
     await expect(claims).toHaveAttribute('aria-pressed', 'false');
 
-    const layerToggle = page.getByRole('button', {
+    const layerToggle = controls.getByRole('button', {
       name: /Ouvrir les calques stratégiques|Open strategic layers/,
     });
     await expect(layerToggle).toBeVisible();
@@ -1134,31 +1445,46 @@ test('keeps zoom and layer controls in the bottom-right, grouped and clear of ma
     const cornerPlacement = await page.evaluate(() => {
       const map = document.querySelector('section[aria-label="Théâtre stratégique"]');
       const controlGroup = document.querySelector('[data-testid="map-controls"]');
+      const claimsButton = controlGroup?.querySelector<HTMLButtonElement>(
+        'button[aria-label="Revendications"], button[aria-label="Claims"]',
+      );
       const layerButton = document.querySelector<HTMLButtonElement>(
         'button[aria-label="Ouvrir les calques stratégiques"], button[aria-label="Open strategic layers"]',
       );
-      if (!map || !controlGroup || !layerButton) return null;
+      if (!map || !controlGroup || !claimsButton || !layerButton) return null;
 
       const mapBounds = map.getBoundingClientRect();
       const controlBounds = controlGroup.getBoundingClientRect();
+      const claimsBounds = claimsButton.getBoundingClientRect();
       const layerBounds = layerButton.getBoundingClientRect();
       return {
-        controlsRightGap: Math.round(mapBounds.right - controlBounds.right),
+        controlsLeftGap: Math.round(controlBounds.left - mapBounds.left),
         controlsBottomGap: Math.round(mapBounds.bottom - controlBounds.bottom),
-        layerRightGap: Math.round(mapBounds.right - layerBounds.right),
-        layerAboveControls: layerBounds.bottom < controlBounds.top,
-        verticalGap: Math.round(controlBounds.top - layerBounds.bottom),
+        layerGrouped: controlGroup.contains(layerButton),
+        layerRightmost: layerBounds.left > claimsBounds.right,
+        sameRow:
+          Math.abs(layerBounds.top - claimsBounds.top) <= 1 &&
+          Math.abs(layerBounds.bottom - claimsBounds.bottom) <= 1,
       };
     });
     expect(cornerPlacement).toEqual({
-      controlsRightGap: testInfo.project.name === 'mobile' ? 10 : 18,
+      controlsLeftGap: testInfo.project.name === 'mobile' ? 10 : 18,
       controlsBottomGap: testInfo.project.name === 'mobile' ? 74 : 16,
-      layerRightGap: testInfo.project.name === 'mobile' ? 10 : 18,
-      layerAboveControls: true,
-      verticalGap: expect.any(Number),
+      layerGrouped: true,
+      layerRightmost: true,
+      sameRow: true,
     });
-    expect(cornerPlacement?.verticalGap).toBeGreaterThanOrEqual(8);
-    expect(cornerPlacement?.verticalGap).toBeLessThanOrEqual(9);
+
+    await layerToggle.click();
+    const layerMenu = page.getByRole('radiogroup', { name: /Calques|Layers/ });
+    await expect(layerMenu).toBeVisible();
+    const layerMenuBounds = await layerMenu.boundingBox();
+    expect(layerMenuBounds).not.toBeNull();
+    expect(layerMenuBounds!.x).toBeGreaterThanOrEqual(0);
+    expect(layerMenuBounds!.x + layerMenuBounds!.width).toBeLessThanOrEqual(
+      testInfo.project.name === 'mobile' ? 390 : 1440,
+    );
+    await page.getByRole('radio', { name: /Politique|Political/ }).click();
 
     const zoomIn = controls.getByRole('button', { name: /Zoomer|Zoom in/ });
     for (let step = 0; step < 10 && (await zoomIn.isEnabled()); step += 1) {
@@ -1188,6 +1514,7 @@ test('keeps zoom and layer controls in the bottom-right, grouped and clear of ma
     }
 
     const placement = await page.evaluate(() => {
+      const map = document.querySelector('section[aria-label="Théâtre stratégique"]');
       const controlGroup = document.querySelector('[data-testid="map-controls"]');
       const claimsButton = controlGroup?.querySelector('button[aria-pressed]');
       const layerButton = document.querySelector<HTMLButtonElement>(
@@ -1196,8 +1523,9 @@ test('keeps zoom and layer controls in the bottom-right, grouped and clear of ma
       const intelPanel = Array.from(document.querySelectorAll('aside')).find((element) =>
         element.textContent?.includes('INTEL'),
       );
-      if (!controlGroup || !claimsButton || !layerButton || !intelPanel) {
+      if (!map || !controlGroup || !claimsButton || !layerButton || !intelPanel) {
         return {
+          controlsLeftGap: -1,
           grouped: false,
           insideViewport: false,
           overlapsIntel: true,
@@ -1206,6 +1534,8 @@ test('keeps zoom and layer controls in the bottom-right, grouped and clear of ma
       }
 
       const buttonBounds = claimsButton.getBoundingClientRect();
+      const mapBounds = map.getBoundingClientRect();
+      const controlBounds = controlGroup.getBoundingClientRect();
       const layerBounds = layerButton.getBoundingClientRect();
       const intelBounds = intelPanel.getBoundingClientRect();
       const overlapsIntel =
@@ -1220,7 +1550,8 @@ test('keeps zoom and layer controls in the bottom-right, grouped and clear of ma
         layerBounds.bottom > intelBounds.top;
 
       return {
-        grouped: controlGroup.contains(claimsButton),
+        controlsLeftGap: Math.round(controlBounds.left - mapBounds.left),
+        grouped: controlGroup.contains(claimsButton) && controlGroup.contains(layerButton),
         insideViewport:
           buttonBounds.left >= 0 &&
           buttonBounds.top >= 0 &&
@@ -1231,6 +1562,7 @@ test('keeps zoom and layer controls in the bottom-right, grouped and clear of ma
       };
     });
     expect(placement).toEqual({
+      controlsLeftGap: testInfo.project.name === 'mobile' ? 10 : 18,
       grouped: true,
       insideViewport: true,
       overlapsIntel: false,
@@ -1239,6 +1571,27 @@ test('keeps zoom and layer controls in the bottom-right, grouped and clear of ma
 
     await claims.click();
     await expect(claims).toHaveAttribute('aria-pressed', 'true');
+
+    await page
+      .getByRole('button', { name: /Actions/ })
+      .last()
+      .click();
+    await expect(page.locator('aside[data-surface="dock"]')).toBeVisible();
+    const dockPlacement = await page.evaluate(() => {
+      const map = document.querySelector('section[aria-label="Théâtre stratégique"]');
+      const controlGroup = document.querySelector('[data-testid="map-controls"]');
+      if (!map || !controlGroup) return null;
+      const mapBounds = map.getBoundingClientRect();
+      const controlBounds = controlGroup.getBoundingClientRect();
+      return {
+        controlsLeftGap: Math.round(controlBounds.left - mapBounds.left),
+        controlsTop: Math.round(controlBounds.top),
+      };
+    });
+    expect(dockPlacement?.controlsLeftGap).toBe(testInfo.project.name === 'mobile' ? 10 : 18);
+
+    await layerToggle.click();
+    await expectWindowContained(layerMenu);
   } finally {
     await request.delete(`/api/v1/games/${game.id}`, { maxRetries: 2 });
   }
@@ -1317,12 +1670,15 @@ test('keeps every campaign window contained, readable and adapted to its content
 
       if (route === 'actions') {
         if (!mobile) expect(metrics.height).toBeLessThan(560);
-        await expect(drawer.getByLabel('Type')).toHaveValue('general');
-        await expect(drawer.getByRole('button', { name: 'Soumettre à validation' })).toBeVisible();
+        await expect(drawer.getByLabel('Type')).toHaveCount(0);
+        await expect(drawer.getByText(/Promulguer|Soumettre/)).toHaveCount(0);
+        await expect(drawer.getByRole('button', { name: 'Planifier' })).toBeVisible();
+        await expect(drawer.getByRole('button', { name: 'Imposer' })).toBeVisible();
         const buttonLayout = await drawer.getByTestId('action-buttons').evaluate((element) => {
           const buttons = Array.from(element.querySelectorAll('button')).map((button) => {
             const bounds = button.getBoundingClientRect();
             return {
+              label: button.getAttribute('aria-label') ?? button.textContent?.trim(),
               bottom: bounds.bottom,
               contentFits: button.scrollWidth <= button.clientWidth + 1,
               left: bounds.left,
@@ -1346,6 +1702,7 @@ test('keeps every campaign window contained, readable and adapted to its content
         expect(buttonLayout.buttons).toHaveLength(4);
         expect(buttonLayout.buttons.every((button) => button.contentFits)).toBe(true);
         expect(buttonLayout.overlaps).toBe(false);
+        expect(buttonLayout.buttons.at(-1)?.label).toBe('Planifier');
       }
       if (!mobile && route === 'diplomacy') {
         expect(metrics.height).toBeLessThan(430);
@@ -1381,6 +1738,37 @@ test('keeps every campaign window contained, readable and adapted to its content
             ),
           );
         expect(promptsFit).toBe(true);
+      }
+      if (route === 'events') {
+        await expect(drawer.getByRole('tab', { name: /Actualités/ })).toHaveAttribute(
+          'aria-selected',
+          'true',
+        );
+        await expect(drawer.getByRole('tab', { name: /Opérations/ })).toBeVisible();
+        const journalScroll = await drawer.evaluate((element) => {
+          const content = element.querySelector<HTMLElement>('[data-testid="journal-content"]');
+          const journal = content?.parentElement;
+          return {
+            contentOverflowY: content ? getComputedStyle(content).overflowY : null,
+            contentWithinJournal:
+              content && journal
+                ? content.getBoundingClientRect().bottom <=
+                  journal.getBoundingClientRect().bottom + 1
+                : false,
+            drawerOverflowX: getComputedStyle(element).overflowX,
+            drawerOverflowY: getComputedStyle(element).overflowY,
+            nestedScrollers: Array.from(element.querySelectorAll<HTMLElement>('*'))
+              .filter((child) => child !== content)
+              .filter((child) => child.scrollHeight > child.clientHeight + 2)
+              .filter((child) => ['auto', 'scroll'].includes(getComputedStyle(child).overflowY))
+              .map((child) => child.className),
+          };
+        });
+        expect(journalScroll.drawerOverflowX).toBe('hidden');
+        expect(journalScroll.drawerOverflowY).toBe('hidden');
+        expect(journalScroll.contentOverflowY).toBe('auto');
+        expect(journalScroll.contentWithinJournal).toBe(true);
+        expect(journalScroll.nestedScrollers).toEqual([]);
       }
       if (route === 'dashboard') {
         expect(metrics.height / metrics.viewportHeight).toBeGreaterThan(0.8);
@@ -1558,12 +1946,14 @@ test('runs the strategic workflow and persists preferences', async ({
   await page.getByRole('option', { name: /FRA/ }).click();
   await page.getByLabel(/Nom de la campagne/).fill('Campagne E2E V3');
   await page.getByRole('button', { name: 'Lancer la campagne' }).click();
-  await expect(page).toHaveURL(/\/game\/[0-9a-f-]+\/dashboard$/);
+  await expect(page).toHaveURL(/\/game\/[0-9a-f-]+\/map$/);
+  await expect(page.getByTestId('event-theater')).toBeVisible();
+  await page.getByTestId('event-theater').getByRole('button', { name: 'Terminer' }).click();
 
   const gameId = new URL(page.url()).pathname.split('/')[2];
   await page.goto(`/game/${gameId}/actions`);
   await page.getByPlaceholder(/Renforcer les défenses/).fill('Sécuriser la frontière orientale.');
-  await page.getByRole('button', { name: 'Soumettre à validation' }).click();
+  await page.getByRole('button', { name: 'Planifier' }).click();
   await expect(page.getByText('Sécuriser la frontière orientale.')).toBeVisible();
 
   await page.goto(`/game/${gameId}/diplomacy`);
@@ -1585,26 +1975,57 @@ test('runs the strategic workflow and persists preferences', async ({
   ).toBeVisible();
   await expect(page.getByRole('button', { name: 'Terminer' })).toBeVisible();
   await expect(page.locator('path[class*="mapEventRegion"]').first()).toBeVisible();
-  await expect(page.getByText('Tour 2')).toBeVisible();
+  await expect(page.getByText('Tour 3')).toBeVisible();
   await page.getByRole('button', { name: 'Terminer' }).click();
   await expect(page.getByText('Événement 1 sur 1')).toHaveCount(0);
   await expect(page.getByText('INTEL · GEO')).toHaveCount(0);
   await page.goto(`/game/${gameId}/events`);
-  await expect(
-    page
-      .getByLabel('Journal stratégique')
-      .getByRole('heading', { name: 'Situation stratégique actualisée', exact: true }),
-  ).toBeVisible();
-  const replayButton = page.getByTestId('timeline-replay-button').first();
-  const strategicEntry = replayButton.locator('xpath=ancestor::article');
-  const strategicCopy = strategicEntry.locator('div').first();
+  const journal = page.locator('[data-section="events"]');
+  const newsTab = journal.getByRole('tab', { name: /Actualités/ });
+  const operationsTab = journal.getByRole('tab', { name: /Opérations/ });
+  const newsEntries = journal.locator('[data-journal-entry="event"]');
+  await expect(newsTab).toHaveAttribute('aria-selected', 'true');
+  await expect(operationsTab).toHaveAttribute('aria-selected', 'false');
+  const newsCount = await newsEntries.count();
+  expect(newsCount).toBeGreaterThan(0);
+  await expect(newsTab.locator('strong')).toHaveText(String(newsCount));
+  await expect(journal.locator('[data-journal-entry="operation"]')).toHaveCount(0);
+  await expect(journal.getByRole('button', { name: 'Voir sur la carte' })).toHaveCount(0);
+  await expect(journal.getByRole('button', { name: 'Modifier' })).toHaveCount(0);
+  await expect(journal.getByRole('button', { name: 'Supprimer' })).toHaveCount(0);
+
+  const firstNewsEntry = newsEntries.first();
+  await firstNewsEntry.click();
+  await expect(journal.getByTestId('journal-detail')).toBeVisible();
+  await expect(journal.getByRole('button', { name: 'Voir sur la carte' })).toBeVisible();
+  await expect(journal.getByRole('button', { name: 'Modifier' })).toBeVisible();
+  await expect(journal.getByRole('button', { name: 'Supprimer' })).toBeVisible();
+  await journal.getByRole('button', { name: 'Retour' }).click();
+  await expect(firstNewsEntry).toBeFocused();
+
+  await operationsTab.click();
+  await expect(operationsTab).toHaveAttribute('aria-selected', 'true');
+  await expect(newsTab).toHaveAttribute('aria-selected', 'false');
+  await expect(journal.locator('[data-journal-entry="event"]')).toHaveCount(0);
+  const operationEntries = journal.locator('[data-journal-entry="operation"]');
+  const operationCount = await operationEntries.count();
+  expect(operationCount).toBeGreaterThan(0);
+  await expect(operationsTab.locator('strong')).toHaveText(String(operationCount));
+  await expect(page.getByTestId('timeline-replay-button')).toHaveCount(0);
+  await operationEntries.first().click();
+  const replayButton = page.getByTestId('timeline-replay-button');
   await expect(replayButton).toBeVisible();
   await expect(replayButton).toHaveAccessibleName(/Rejouer la séquence/);
-  const replayBounds = await replayButton.boundingBox();
-  const copyBounds = await strategicCopy.boundingBox();
-  expect(replayBounds?.width).toBeLessThanOrEqual(120);
-  expect(copyBounds?.width).toBeGreaterThan(replayBounds?.width ?? 0);
-  await page.getByRole('button', { name: 'Voir sur la carte' }).click();
+  await replayButton.click();
+  await expect(page).toHaveURL(new RegExp(`/game/${gameId}/map$`));
+  await expect(
+    page.getByRole('heading', { name: 'Situation stratégique actualisée', exact: true }),
+  ).toBeVisible();
+  await page.keyboard.press('Escape');
+
+  await page.goto(`/game/${gameId}/events`);
+  await journal.locator('[data-journal-entry="event"]').first().click();
+  await journal.getByRole('button', { name: 'Voir sur la carte' }).click();
   await expect(page).toHaveURL(new RegExp(`/game/${gameId}/map$`));
   await expect(page.getByText('Événement 1 sur 1')).toBeVisible();
   await expect(page.getByText('INTEL · GEO')).toHaveCount(0);

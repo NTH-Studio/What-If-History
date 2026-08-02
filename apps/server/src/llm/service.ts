@@ -1,4 +1,4 @@
-import { z, ZodError, type ZodType } from 'zod';
+import { ZodError, type ZodType } from 'zod';
 import {
   generatedTurnSchema,
   type Action,
@@ -24,15 +24,28 @@ import {
   type CompletionRequest,
   type CompletionResult,
 } from './providers.js';
-import {
-  actionValidationResponseSchema,
-  generatedTurnResponseSchemaFor,
-} from './response-schemas.js';
+import { generatedTurnResponseSchemaFor } from './response-schemas.js';
 
-const actionValidationSchema = z.object({
-  accepted: z.boolean(),
-  reason: z.string().max(500),
-});
+const TURN_GENERATION_MAX_TOKENS = 4_000;
+
+export function generatedTurnSchemaForImposedActionIds(imposedActionIds: string[]) {
+  const expectedImposedActionIds = new Set(imposedActionIds);
+  return generatedTurnSchema.superRefine((value, issueContext) => {
+    const acknowledged = value.resolved_imposed_action_ids;
+    const acknowledgedSet = new Set(acknowledged);
+    const exactMatch =
+      acknowledged.length === acknowledgedSet.size &&
+      acknowledgedSet.size === expectedImposedActionIds.size &&
+      [...expectedImposedActionIds].every((id) => acknowledgedSet.has(id));
+    if (!exactMatch) {
+      issueContext.addIssue({
+        code: 'custom',
+        path: ['resolved_imposed_action_ids'],
+        message: 'Every imposed action id must be acknowledged exactly once.',
+      });
+    }
+  });
+}
 
 function projectRegions(regions: GameRegion[], actions: Action[]): GameRegion[] {
   const projected = new Map(
@@ -41,7 +54,7 @@ function projectRegions(regions: GameRegion[], actions: Action[]): GameRegion[] 
       { ...region, claimNationCodes: [...region.claimNationCodes] },
     ]),
   );
-  for (const action of actions) {
+  for (const action of actions.filter((candidate) => candidate.mode === 'imposed')) {
     for (const effect of action.effects) {
       if (effect.kind !== 'territory') continue;
       const region = projected.get(effect.regionId);
@@ -307,44 +320,6 @@ export class LlmService {
     };
   }
 
-  async validateAction(
-    game: Game,
-    text: string,
-    activity: LlmActivityHandle,
-    language: GenerationLanguage = 'fr',
-  ) {
-    const result = await this.complete(
-      this.localized(
-        this.withPresetPrompt(game, 'actions', {
-          ...prompts.actionValidation(game, text),
-          maxTokens: 300,
-          temperature: 0.2,
-          responseFormat: 'json',
-          responseSchema: {
-            name: 'action_validation',
-            schema: actionValidationResponseSchema,
-          },
-        }),
-        language,
-      ),
-      activity,
-      this.settingsForGame(game, 'actions'),
-    );
-    const parsed = await this.parseOrRepair(
-      result,
-      actionValidationSchema,
-      { accepted: true, reason: '1-500 chars' },
-      activity,
-      this.settingsForGame(game, 'actions'),
-      300,
-      {
-        name: 'action_validation',
-        schema: actionValidationResponseSchema,
-      },
-    );
-    return parsed;
-  }
-
   async brainstorm(
     game: Game,
     activity: LlmActivityHandle,
@@ -465,6 +440,9 @@ export class LlmService {
       };
     };
     const expectedOutput = turnContext.output;
+    const imposedActionIds = actions
+      .filter((action) => action.status === 'pending' && action.mode === 'imposed')
+      .map((action) => action.id);
     const responseSchema = generatedTurnResponseSchemaFor({
       nationCodes: game.nationStates.map((state) => state.nationCode),
       regionIds: firstStringColumn(turnContext.worldState.regions),
@@ -476,13 +454,15 @@ export class LlmService {
         .filter((law) => law.nationCode === game.playerNation.code)
         .slice(0, 20)
         .map((law) => law.id),
+      imposedActionIds,
     });
+    const validatedTurnSchema = generatedTurnSchemaForImposedActionIds(imposedActionIds);
     const settings = this.settingsForGame(game, 'turns');
     const result = await this.complete(
       this.localized(
         this.withPresetPrompt(game, 'turns', {
           ...turnPrompt,
-          maxTokens: 1_500,
+          maxTokens: TURN_GENERATION_MAX_TOKENS,
           temperature: 0.3,
           responseFormat: 'json',
           responseSchema: {
@@ -497,11 +477,11 @@ export class LlmService {
     );
     const parsed = await this.parseOrRepair(
       result,
-      generatedTurnSchema,
+      validatedTurnSchema,
       expectedOutput,
       activity,
       settings,
-      1_500,
+      TURN_GENERATION_MAX_TOKENS,
       {
         name: 'generated_turn',
         schema: responseSchema,

@@ -317,6 +317,11 @@ export class AdvancedRepository {
     if (!payload?.game || text(payload.game.id) !== gameId) {
       throw new AppError(422, 'INVALID_SNAPSHOT', 'The snapshot payload is invalid.');
     }
+    const restoredActions = payload.actions.map((action) => ({
+      ...action,
+      action_mode:
+        action.action_mode ?? (text(action.action_type) === 'law' ? 'imposed' : 'planned'),
+    }));
     const deleteTables = [
       ['timeline_entries', payload.timeline ?? []],
       ['historical_transition_runs', payload.historicalTransitions ?? []],
@@ -333,7 +338,7 @@ export class AdvancedRepository {
       ['strategic_arsenals', payload.arsenals ?? []],
       ['events', payload.events],
       ['country_laws', payload.laws],
-      ['actions', payload.actions],
+      ['actions', restoredActions],
       ['units', payload.units],
       ['nation_states', payload.nationStates],
       ['game_regions', payload.regions],
@@ -853,6 +858,7 @@ export class AdvancedRepository {
     const currentRevision = this.currentWorldRevision(gameId);
     const stale = actions.find(
       (action) =>
+        action.mode === 'imposed' &&
         action.effects.length > 0 &&
         action.previewWorldRevision !== null &&
         action.previewWorldRevision !== currentRevision,
@@ -868,7 +874,7 @@ export class AdvancedRepository {
   }
 
   applyActionEffects(gameId: string, turnNumber: number, actions: Action[]) {
-    for (const action of actions) {
+    for (const action of actions.filter((candidate) => candidate.mode === 'imposed')) {
       for (const effect of action.effects) {
         this.applyWorldEffect(gameId, turnNumber, effect, {
           source: 'player_action',

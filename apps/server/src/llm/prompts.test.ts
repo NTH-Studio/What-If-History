@@ -37,7 +37,6 @@ const parseUser = (value: { user: string }) => JSON.parse(value.user) as Record<
 describe('scenario-aware LLM prompts', () => {
   it('supplies the premise and rules to every player-facing simulation flow', () => {
     const requests = [
-      prompts.actionValidation(game, 'Fermer les frontières.'),
       prompts.brainstorm(game),
       prompts.advisor(game, 'Que faire ?'),
       prompts.diplomacy(game, 'United Kingdom', [], 'Coopérons.'),
@@ -73,11 +72,20 @@ describe('scenario-aware LLM prompts', () => {
       aiResponse: 'Promulguée sans vote.',
       turnNumber: 2,
       createdAt: '2026-01-01T00:00:00.000Z',
+      mode: 'imposed',
       effects: [],
       effectStatus: 'queued',
       previewWorldRevision: null,
     } satisfies Action;
-    const request = prompts.turn(game, { amount: 1, unit: 'week' }, [law], events);
+    const planned = {
+      ...law,
+      id: '20000000-0000-4000-8000-000000000000',
+      actionText: 'Tenter de renforcer les défenses.',
+      actionType: 'military',
+      mode: 'planned',
+      effectStatus: 'resolved',
+    } satisfies Action;
+    const request = prompts.turn(game, { amount: 1, unit: 'week' }, [planned, law], events);
     const payload = parseUser(request);
     const recentEvents = payload.recentEvents as Array<{ description: string }>;
 
@@ -85,12 +93,21 @@ describe('scenario-aware LLM prompts', () => {
     expect(recentEvents).toHaveLength(8);
     expect(recentEvents.every((event) => event.description.length <= 400)).toBe(true);
     expect(request.system).toContain('instead of restarting or repeating');
-    expect(request.system).toContain('authoritative sovereign decision');
-    expect(request.system).toContain('never cancel, reject, reverse, duplicate or condition');
+    expect(request.system).toContain('plannedOrders are attempts');
+    expect(request.system).toContain('imposedFacts are canonical player facts');
+    expect(request.system).toContain('resolved_imposed_action_ids');
     expect(request.system).toContain('appropriate to the supplied date');
+    expect(request.system).toContain('Generate three to six distinct, concise events');
+    expect(request.system).not.toContain('Generate one or two');
     expect(request.system).not.toContain('WW2-era');
-    expect(payload.pendingActions).toEqual([
-      { id: law.id, type: law.actionType, order: law.actionText, confirmedEffects: [] },
+    expect(payload.plannedOrders).toEqual([
+      { id: planned.id, order: planned.actionText, interpretedEffects: [] },
+    ]);
+    expect(payload.imposedFacts).toEqual([
+      { id: law.id, fact: law.actionText, guaranteedEffects: [] },
+    ]);
+    expect((payload.output as Record<string, unknown>).resolved_imposed_action_ids).toEqual([
+      law.id,
     ]);
   });
 
@@ -102,7 +119,6 @@ describe('scenario-aware LLM prompts', () => {
       worldContext: 'Historical 1936 start. Europe is on the brink of tension as ideologies clash.',
     } satisfies Game;
     const requests = [
-      prompts.actionValidation(modernGame, 'Lancer une bombe nucléaire sur Londres.'),
       prompts.brainstorm(modernGame),
       prompts.enhanceAction(modernGame, 'Moderniser les forces armées.'),
       prompts.advisor(modernGame, 'Quelles technologies sont disponibles ?'),
@@ -121,9 +137,6 @@ describe('scenario-aware LLM prompts', () => {
       expect(request.system).toContain('The authoritative campaign date is exactly 2000-01-01.');
       expect(request.system).not.toContain('WW2-era');
     }
-    expect(requests[0]!.system).toContain(
-      'do not reject it merely because its target is currently an ally',
-    );
   });
 
   it('keeps a large campaign world inside a local-model prompt budget', () => {

@@ -3,7 +3,6 @@ import {
   actionPreviewInputSchema,
   createActionInputSchema,
   enhanceActionInputSchema,
-  promulgateLawInputSchema,
   updateActionInputSchema,
 } from '@what-if-history/contracts';
 import { AppError } from '../errors.js';
@@ -25,86 +24,14 @@ export function registerActionRoutes(router: Router, context: ApiRouteContext) {
     const input = actionPreviewInputSchema.parse(req.body);
     res.json(dependencies.actionEffects.preview(gameId, input, requestLanguage(req)));
   });
-  router.post('/games/:gameId/actions', llmLimiter, async (req, res) => {
+  router.post('/games/:gameId/actions', (req, res) => {
     const gameId = parseUuid(req.params.gameId);
     const input = createActionInputSchema.parse(req.body);
     const resolvedInput =
       input.effects === undefined
         ? dependencies.actionEffects.preview(
             gameId,
-            {
-              actionText: input.actionText,
-              actionType: input.actionType,
-            },
-            requestLanguage(req),
-          )
-        : null;
-    // A v3 client cannot display the v4 ambiguity selectors. Preserve the public
-    // compatibility contract by queueing the text without a guaranteed mutation;
-    // current clients always preview first and remain blocked by the selector UI.
-    const legacyEffects =
-      resolvedInput?.ambiguities.length && input.effects === undefined
-        ? []
-        : resolvedInput?.effects;
-    const confirmedInput = resolvedInput
-      ? {
-          ...input,
-          effects: legacyEffects ?? [],
-          previewWorldRevision: resolvedInput.worldRevision,
-        }
-      : input;
-    if ((confirmedInput.effects?.length ?? 0) > 0) {
-      const reason =
-        requestLanguage(req) === 'en'
-          ? 'Confirmed sovereign act. Its guaranteed effects are queued for the next turn.'
-          : 'Acte souverain confirmé. Ses effets garantis sont mis en file pour le prochain tour.';
-      res
-        .status(201)
-        .json(dependencies.repository.createAction(gameId, confirmedInput, true, reason));
-      return;
-    }
-    const game = dependencies.repository.getGame(gameId);
-    const activity = dependencies.llmActivity.start({
-      gameId,
-      gameName: game.name,
-      requestId: requestId(res),
-      clientId: requestClientId(req),
-      type: 'action_validation',
-    });
-    try {
-      const validation = await dependencies.llm.validateAction(
-        game,
-        confirmedInput.actionText,
-        activity,
-        requestLanguage(req),
-      );
-      activity.phase('applying_result');
-      const validationReason = validation.value.accepted
-        ? validation.value.reason
-        : requestLanguage(req) === 'en'
-          ? `Player decision queued for simulation. Advisory AI warning: ${validation.value.reason}`
-          : `Décision du joueur mise en file pour simulation. Avis consultatif de l’IA : ${validation.value.reason}`;
-      const action = dependencies.repository.createAction(
-        gameId,
-        confirmedInput,
-        true,
-        validationReason,
-      );
-      activity.succeed(validation.usage);
-      res.status(201).json(action);
-    } catch (error) {
-      activity.fail(error);
-      throw error;
-    }
-  });
-  router.post('/games/:gameId/actions/promulgate-law', (req, res) => {
-    const gameId = parseUuid(req.params.gameId);
-    const input = promulgateLawInputSchema.parse(req.body);
-    const resolvedInput =
-      input.effects === undefined
-        ? dependencies.actionEffects.preview(
-            gameId,
-            { actionText: input.actionText, actionType: 'law' },
+            { actionText: input.actionText },
             requestLanguage(req),
           )
         : null;
@@ -120,11 +47,13 @@ export function registerActionRoutes(router: Router, context: ApiRouteContext) {
       : input;
     const reason =
       requestLanguage(req) === 'en'
-        ? 'Promulgated without a vote. The law is queued and will enter into force on the next turn.'
-        : 'Promulguée sans vote. La loi est mise en file et entrera en vigueur au prochain tour.';
-    res
-      .status(201)
-      .json(dependencies.repository.createPromulgatedLaw(gameId, confirmedInput, reason));
+        ? confirmedInput.mode === 'imposed'
+          ? 'Imposed. This fact is guaranteed on the next turn; only its consequences will be simulated.'
+          : 'Planned. The simulation will decide its success and consequences on the next turn.'
+        : confirmedInput.mode === 'imposed'
+          ? 'Imposé. Ce fait est garanti au prochain tour ; seules ses conséquences seront simulées.'
+          : 'Planifié. La simulation décidera de sa réussite et de ses conséquences au prochain tour.';
+    res.status(201).json(dependencies.repository.createAction(gameId, confirmedInput, reason));
   });
   router.post('/games/:gameId/actions/brainstorm', llmLimiter, async (req, res) => {
     const game = dependencies.repository.getGame(parseUuid(req.params.gameId));

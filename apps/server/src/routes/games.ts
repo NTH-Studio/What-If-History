@@ -27,6 +27,30 @@ export function registerGameRoutes(router: Router, context: ApiRouteContext) {
     dependencies.strategic.ensureGame(game.id);
     res.status(201).json(game);
   });
+  router.post('/games/start', llmLimiter, async (req, res) => {
+    const language = requestLanguage(req);
+    const input = createGameInputSchema.parse(req.body);
+    const game = dependencies.repository.createGame(input, language);
+    try {
+      dependencies.strategic.ensureGame(game.id);
+      const openingTurn = await dependencies.turns.advance(
+        game.id,
+        { amount: 1, unit: 'day' },
+        { requestId: requestId(res), clientId: requestClientId(req) },
+        randomUUID(),
+        language,
+      );
+      const launchedGame = dependencies.repository.getGame(game.id, language);
+      res.status(201).json({
+        ...launchedGame,
+        game: launchedGame,
+        openingTurn,
+      });
+    } catch (error) {
+      dependencies.repository.deleteGame(game.id);
+      throw error;
+    }
+  });
   router.get('/games/:gameId', (req, res) => {
     res.json(dependencies.repository.getGame(parseUuid(req.params.gameId), requestLanguage(req)));
   });

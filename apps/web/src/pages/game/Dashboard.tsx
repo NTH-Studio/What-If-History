@@ -1,6 +1,7 @@
 import { Landmark, Shield, Sparkles, Swords, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../../api';
+import { formatCalendarDate } from '../../dateFormatting';
 import styles from '../../styles/App.module.css';
 
 export function Dashboard({
@@ -16,7 +17,7 @@ export function Dashboard({
   units: Awaited<ReturnType<typeof api.units>>;
   onClose: () => void;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const player = game.nationStates.find((state) => state.nationCode === game.playerNationCode);
   const metrics = [
     [t('game.stability'), `${Math.round(player?.stability ?? 0)}%`],
@@ -30,7 +31,9 @@ export function Dashboard({
     <div className={styles.dashboard}>
       <header className={`${styles.workspaceHeader} ${styles.surfaceHeader}`}>
         <div>
-          <p className={styles.eyebrow}>SITREP · {game.currentDate}</p>
+          <p className={styles.eyebrow}>
+            SITREP · {formatCalendarDate(game.currentDate, i18n.language, 'medium')}
+          </p>
           <h1>{t('game.strategicOverview')}</h1>
         </div>
         <div className={styles.surfaceHeaderActions}>

@@ -6,6 +6,7 @@ import type {
   AdvisorMessage,
   Chat,
   ChatMessage,
+  CampaignLaunchResult,
   CreateActionInput,
   CreateGameInput,
   CountryProfile,
@@ -133,6 +134,11 @@ export const api = {
   game: (id: string) => request<Game>(`/games/${id}`),
   createGame: (input: CreateGameInput) =>
     request<Game>('/games', { method: 'POST', body: JSON.stringify(input) }),
+  startGame: (input: CreateGameInput) =>
+    request<CampaignLaunchResult>('/games/start', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
   renameGame: (id: string, name: string) =>
     request<Game>(`/games/${id}`, { method: 'PATCH', body: JSON.stringify({ name }) }),
   deleteGame: (id: string) => request<void>(`/games/${id}`, { method: 'DELETE' }),
@@ -152,18 +158,6 @@ export const api = {
     }),
   createAction: (id: string, input: CreateActionInput) =>
     request<Action>(`/games/${id}/actions`, { method: 'POST', body: JSON.stringify(input) }),
-  promulgateLaw: (
-    id: string,
-    input: {
-      actionText: string;
-      effects?: ActionPreview['effects'];
-      previewWorldRevision?: number;
-    },
-  ) =>
-    request<Action>(`/games/${id}/actions/promulgate-law`, {
-      method: 'POST',
-      body: JSON.stringify(input),
-    }),
   brainstorm: (id: string) =>
     request<{ suggestions: string }>(`/games/${id}/actions/brainstorm`, { method: 'POST' }),
   enhanceAction: (id: string, actionText: string) =>
@@ -310,7 +304,10 @@ export const api = {
       `/presets/${id}/preview${gameId ? `?gameId=${encodeURIComponent(gameId)}` : ''}`,
     ),
   playPreset: (id: string, input: { nationCode: string; name?: string; difficulty?: string }) =>
-    request<Game>(`/presets/${id}/play`, { method: 'POST', body: JSON.stringify(input) }),
+    request<CampaignLaunchResult>(`/presets/${id}/play`, {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
   llmSettings: () => request<LlmSettingsPublic>('/llm/settings'),
   saveLlmSettings: (input: LlmSettingsInput) =>
     request<LlmSettingsPublic>('/llm/settings', {

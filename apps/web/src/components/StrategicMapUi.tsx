@@ -75,7 +75,7 @@ const escapeMarkerText = (value: string) =>
     return entities[character] ?? character;
   });
 
-const layerOptions: Array<{
+export const strategicLayerOptions: Array<{
   id: StrategicLayer;
   icon: typeof Layers3;
   label: string;
@@ -90,51 +90,6 @@ const layerOptions: Array<{
   { id: 'intelligence', icon: Eye, label: 'strategic.layers.intelligence' },
   { id: 'events', icon: Flame, label: 'strategic.layers.events' },
 ];
-
-export function StrategicLayerControl({
-  active,
-  onChange,
-}: {
-  active: StrategicLayer;
-  onChange: (layer: StrategicLayer) => void;
-}) {
-  const { t } = useTranslation();
-  const [expanded, setExpanded] = useState(false);
-  return (
-    <div className={styles.strategicLayerControl} data-expanded={expanded}>
-      <button
-        type="button"
-        className={styles.strategicLayerToggle}
-        aria-label={t('strategic.layers.open')}
-        aria-expanded={expanded}
-        onClick={() => setExpanded((current) => !current)}
-      >
-        <Layers3 size={18} />
-        <span>{t('strategic.layers.title')}</span>
-      </button>
-      {expanded ? (
-        <div role="radiogroup" aria-label={t('strategic.layers.title')}>
-          {layerOptions.map(({ id, icon: Icon, label }) => (
-            <button
-              type="button"
-              role="radio"
-              aria-checked={active === id}
-              data-active={active === id}
-              key={id}
-              onClick={() => {
-                onChange(id);
-                setExpanded(false);
-              }}
-            >
-              <Icon size={16} />
-              <span>{t(label)}</span>
-            </button>
-          ))}
-        </div>
-      ) : null}
-    </div>
-  );
-}
 
 export function StrategicMapOverlays({
   state,

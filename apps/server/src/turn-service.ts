@@ -85,11 +85,13 @@ export class TurnService {
         generated.value.events,
       );
       const confirmedTerritoryIds = new Set(
-        pendingActions.flatMap((action) =>
-          action.effects
-            .filter((effect) => effect.kind === 'territory')
-            .map((effect) => effect.regionId),
-        ),
+        pendingActions
+          .filter((action) => action.mode === 'imposed')
+          .flatMap((action) =>
+            action.effects
+              .filter((effect) => effect.kind === 'territory')
+              .map((effect) => effect.regionId),
+          ),
       );
       const secondaryRegionChanges = generated.value.region_changes.filter(
         (change) => !confirmedTerritoryIds.has(change.region_id),

@@ -6,6 +6,7 @@ import { useHistory } from 'react-router-dom';
 import type { ScenarioMode } from '@what-if-history/contracts';
 import { api, ApiError } from '../../api';
 import { Modal } from '../../components/Dialogs';
+import { queueEventPlayback } from '../../eventPlayback';
 import styles from '../../styles/App.module.css';
 
 export function NewGameDialog({
@@ -19,7 +20,7 @@ export function NewGameDialog({
   nations: Awaited<ReturnType<typeof api.nations>>;
   onError: (message?: string) => void;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const history = useHistory();
   const queryClient = useQueryClient();
   const [nationCode, setNationCode] = useState('');
@@ -34,21 +35,29 @@ export function NewGameDialog({
   const [name, setName] = useState('');
   const [scenarioMode, setScenarioMode] = useState<ScenarioMode>('historical');
   const [scenarioPremise, setScenarioPremise] = useState('');
+  const historicalCoverageStart = '1870-01-01';
+  const historicalCoverageEnd = '2026-07-31';
+  const historicalDateIsComplete = /^\d{4}-\d{2}-\d{2}$/.test(startDate);
+  const historicalDateIsSupported =
+    historicalDateIsComplete &&
+    startDate >= historicalCoverageStart &&
+    startDate <= historicalCoverageEnd;
   const historicalWorld = useQuery({
     queryKey: ['historical-world-preview', startDate],
     queryFn: () => api.historicalWorld(startDate),
-    enabled: open && /^\d{4}-\d{2}-\d{2}$/.test(startDate),
+    enabled: open && historicalDateIsSupported,
     retry: false,
   });
   const historicalWorldErrorCode =
     historicalWorld.error instanceof ApiError ? historicalWorld.error.problem.code : undefined;
   const datedNations = historicalWorld.data?.nations ?? nations;
   const mutation = useMutation({
-    mutationFn: api.createGame,
-    onSuccess: async (game) => {
+    mutationFn: api.startGame,
+    onSuccess: async ({ game, openingTurn }) => {
+      queueEventPlayback(game.id, openingTurn.events);
       await queryClient.invalidateQueries({ queryKey: ['games'] });
       onOpenChange(false);
-      history.push(`/game/${game.id}/dashboard`);
+      history.push(`/game/${game.id}/map`);
     },
     onError: (caught) => {
       onError(caught instanceof ApiError ? caught.problem.detail : t('common.error'));
@@ -250,8 +259,9 @@ export function NewGameDialog({
             <span>{t('newGame.date')}</span>
             <input
               type="date"
-              min={historicalWorld.data?.coverageStart ?? '1870-01-01'}
-              max={historicalWorld.data?.coverageEnd ?? '2026-07-31'}
+              lang={i18n.resolvedLanguage ?? i18n.language}
+              min={historicalWorld.data?.coverageStart ?? historicalCoverageStart}
+              max={historicalWorld.data?.coverageEnd ?? historicalCoverageEnd}
               value={startDate}
               onChange={(event) => setStartDate(event.target.value)}
               required
@@ -278,7 +288,11 @@ export function NewGameDialog({
           </label>
         </div>
         <section className={styles.historicalPreview} aria-live="polite">
-          {historicalWorld.isPending ? (
+          {historicalDateIsComplete && !historicalDateIsSupported ? (
+            <p data-tone="error">{t('newGame.historicalWorldUnavailable')}</p>
+          ) : !historicalDateIsComplete ? (
+            <p>{t('newGame.selectNationForPreview')}</p>
+          ) : historicalWorld.isPending ? (
             <p>{t('newGame.loadingHistoricalWorld')}</p>
           ) : historicalWorld.isError ? (
             <p data-tone="error">
@@ -370,13 +384,14 @@ export function NewGameDialog({
             className={styles.primaryButton}
             disabled={
               mutation.isPending ||
+              !historicalDateIsSupported ||
               historicalWorld.isPending ||
               historicalWorld.isError ||
               !nationCode ||
               (scenarioMode === 'custom' && !scenarioPremise.trim())
             }
           >
-            {mutation.isPending ? t('common.loading') : t('newGame.create')}
+            {mutation.isPending ? t('newGame.simulatingFirstDay') : t('newGame.create')}
           </button>
         </footer>
       </form>

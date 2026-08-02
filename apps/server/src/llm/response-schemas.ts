@@ -300,24 +300,15 @@ const characterChange = {
   ],
 } as const;
 
-export const actionValidationResponseSchema = {
-  type: 'object',
-  properties: {
-    accepted: { type: 'boolean' },
-    reason: { type: 'string' },
-  },
-  required: ['accepted', 'reason'],
-  additionalProperties: false,
-} as const;
-
 export const generatedTurnResponseSchema = {
   type: 'object',
   properties: {
     time_advance_amount: { type: 'integer' },
+    resolved_imposed_action_ids: { type: 'array', items: { type: 'string' } },
     events: {
       type: 'array',
-      minItems: 1,
-      maxItems: 2,
+      minItems: 3,
+      maxItems: 6,
       items: {
         type: 'object',
         properties: {
@@ -385,6 +376,7 @@ export const generatedTurnResponseSchema = {
     character_changes: { type: 'array', items: characterChange },
   },
   required: [
+    'resolved_imposed_action_ids',
     'events',
     'law_changes',
     'region_changes',
@@ -402,6 +394,7 @@ export interface GeneratedTurnResponseIdentifiers {
   characterIds: string[];
   featureIds: string[];
   lawIds: string[];
+  imposedActionIds: string[];
 }
 
 type SchemaRecord = Record<string, unknown>;
@@ -460,6 +453,12 @@ function constrainBranchIdentifier(
 export function generatedTurnResponseSchemaFor(identifiers: GeneratedTurnResponseIdentifiers) {
   const schema = record(structuredClone(generatedTurnResponseSchema));
   const rootProperties = record(schema.properties);
+  const resolvedImposedActions = record(rootProperties.resolved_imposed_action_ids);
+  resolvedImposedActions.minItems = identifiers.imposedActionIds.length;
+  resolvedImposedActions.maxItems = identifiers.imposedActionIds.length;
+  if (identifiers.imposedActionIds.length > 0) {
+    setEnum(record(resolvedImposedActions.items), identifiers.imposedActionIds);
+  }
   const event = record(record(rootProperties.events).items);
   const eventProperties = record(event.properties);
   setEnum(record(record(eventProperties.affected_nations).items), identifiers.nationCodes);

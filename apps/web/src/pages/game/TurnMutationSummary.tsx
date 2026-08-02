@@ -1,6 +1,7 @@
 import { MapPin } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import type { AppliedMutation } from '@what-if-history/contracts';
+import { formatCalendarDate, isIsoCalendarDate } from '../../dateFormatting';
 import styles from '../../styles/App.module.css';
 
 export function TurnMutationSummary({
@@ -121,6 +122,7 @@ function formatMutationValue(
     return value.map((item) => formatMutationValue(item, locale, t)).join(' · ');
   }
   if (typeof value === 'string') {
+    if (isIsoCalendarDate(value)) return formatCalendarDate(value, locale, 'medium');
     return t(`turnSummary.values.${value}`, { defaultValue: humanizeIdentifier(value) });
   }
   return '…';

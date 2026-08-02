@@ -46,7 +46,7 @@ type StudioSection = (typeof studioSections)[number];
 
 export function PresetStudioPage() {
   const { presetId = '' } = useParams<{ presetId: string }>();
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const history = useHistory();
   const queryClient = useQueryClient();
   const preset = useQuery({
@@ -241,6 +241,7 @@ export function PresetStudioPage() {
                 <span>{t('presets.date')}</span>
                 <input
                   type="date"
+                  lang={i18n.resolvedLanguage ?? i18n.language}
                   value={draft.startDate}
                   onChange={(event) => set('startDate', event.target.value)}
                 />

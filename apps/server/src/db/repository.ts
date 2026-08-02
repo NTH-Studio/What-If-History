@@ -21,7 +21,6 @@ import type {
   LlmTokenUsage,
   Nation,
   NationState,
-  PromulgateLawInput,
   ScenarioMode,
   UpdateActionInput,
   UpdateGameConfigInput,
@@ -536,77 +535,33 @@ export class Repository {
     }));
   }
 
-  createAction(
-    gameId: string,
-    input: CreateActionInput,
-    accepted: boolean,
-    reason?: string,
-  ): Action {
+  createAction(gameId: string, input: CreateActionInput, reason: string): Action {
     const game = this.getGame(gameId);
     const action: Action = {
       id: randomUUID(),
       gameId,
       nationCode: game.playerNationCode,
       actionText: input.actionText,
-      actionType: input.actionType,
-      status: accepted ? 'pending' : 'rejected',
-      aiResponse: reason ?? null,
-      turnNumber: game.turnNumber,
-      createdAt: now(),
-      effects: input.effects ?? [],
-      effectStatus: accepted ? 'queued' : 'failed',
-      previewWorldRevision: input.previewWorldRevision ?? null,
-    };
-    this.assertPreviewRevision(gameId, action.effects, action.previewWorldRevision);
-    this.database
-      .prepare(
-        `INSERT INTO actions (
-          id, game_id, nation_code, action_text, action_type, status,
-          ai_response, turn_number, created_at, effects_json, effect_status,
-          preview_world_revision
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        action.id,
-        action.gameId,
-        action.nationCode,
-        action.actionText,
-        action.actionType,
-        action.status,
-        action.aiResponse,
-        action.turnNumber,
-        action.createdAt,
-        JSON.stringify(action.effects),
-        action.effectStatus,
-        action.previewWorldRevision,
-      );
-    return action;
-  }
-
-  createPromulgatedLaw(gameId: string, input: PromulgateLawInput, reason: string): Action {
-    const game = this.getGame(gameId);
-    const action: Action = {
-      id: randomUUID(),
-      gameId,
-      nationCode: game.playerNationCode,
-      actionText: input.actionText,
-      actionType: 'law',
+      actionType: 'general',
       status: 'pending',
       aiResponse: reason,
       turnNumber: game.turnNumber,
       createdAt: now(),
+      mode: input.mode,
       effects: input.effects ?? [],
-      effectStatus: 'queued',
+      effectStatus: input.mode === 'imposed' ? 'queued' : 'resolved',
       previewWorldRevision: input.previewWorldRevision ?? null,
     };
-    this.assertPreviewRevision(gameId, action.effects, action.previewWorldRevision);
+    if (action.mode === 'imposed') {
+      this.assertPreviewRevision(gameId, action.effects, action.previewWorldRevision);
+    }
     this.database
       .prepare(
         `INSERT INTO actions (
           id, game_id, nation_code, action_text, action_type, status,
           ai_response, turn_number, created_at, effects_json, effect_status,
-          preview_world_revision
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          preview_world_revision, action_mode
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         action.id,
@@ -621,6 +576,7 @@ export class Repository {
         JSON.stringify(action.effects),
         action.effectStatus,
         action.previewWorldRevision,
+        action.mode,
       );
     return action;
   }
@@ -636,25 +592,29 @@ export class Repository {
 
   updateAction(gameId: string, actionId: string, input: UpdateActionInput): Action {
     const current = this.database
-      .prepare(
-        `SELECT * FROM actions
-         WHERE id = ? AND game_id = ? AND status = 'pending' AND action_type <> 'law'`,
-      )
+      .prepare(`SELECT * FROM actions WHERE id = ? AND game_id = ? AND status = 'pending'`)
       .get(actionId, gameId) as Row | undefined;
     if (!current) throw notFound('Pending action');
-    const effects = input.effects ?? parseJson<WorldEffect[]>(current.effects_json, []);
+    const effects =
+      input.effects ??
+      (asString(current.action_type) === 'law'
+        ? []
+        : parseJson<WorldEffect[]>(current.effects_json, []));
+    const mode = input.mode ?? (asString(current.action_mode || 'planned') as Action['mode']);
     const previewWorldRevision =
       input.previewWorldRevision ?? asNullableNumber(current.preview_world_revision);
-    this.assertPreviewRevision(gameId, effects, previewWorldRevision);
+    if (mode === 'imposed') this.assertPreviewRevision(gameId, effects, previewWorldRevision);
     this.database
       .prepare(
-        `UPDATE actions SET action_text = ?, action_type = ?, effects_json = ?,
-         effect_status = 'queued', preview_world_revision = ? WHERE id = ? AND game_id = ?`,
+        `UPDATE actions SET action_text = ?, action_type = 'general', action_mode = ?,
+         effects_json = ?, effect_status = ?, preview_world_revision = ?, ai_response = NULL
+         WHERE id = ? AND game_id = ?`,
       )
       .run(
         input.actionText ?? asString(current.action_text),
-        input.actionType ?? asString(current.action_type),
+        mode,
         JSON.stringify(effects),
+        mode === 'imposed' ? 'queued' : 'resolved',
         previewWorldRevision,
         actionId,
         gameId,
@@ -667,9 +627,7 @@ export class Repository {
 
   deleteAction(gameId: string, actionId: string) {
     const result = this.database
-      .prepare(
-        "DELETE FROM actions WHERE id = ? AND game_id = ? AND status = 'pending' AND action_type <> 'law'",
-      )
+      .prepare("DELETE FROM actions WHERE id = ? AND game_id = ? AND status = 'pending'")
       .run(actionId, gameId);
     this.expectChange(result, 'Pending action');
   }
@@ -898,7 +856,8 @@ export class Repository {
 
       this.database
         .prepare(
-          `UPDATE actions SET status = 'completed', effect_status = 'applied'
+          `UPDATE actions SET status = 'completed',
+             effect_status = CASE WHEN action_mode = 'imposed' THEN 'applied' ELSE 'resolved' END
            WHERE game_id = ? AND status = 'pending'`,
         )
         .run(gameId);
@@ -1267,6 +1226,9 @@ export class Repository {
     aiResponse: row.ai_response === null ? null : asString(row.ai_response),
     turnNumber: asNumber(row.turn_number),
     createdAt: asString(row.created_at),
+    mode: asString(
+      row.action_mode || (asString(row.action_type) === 'law' ? 'imposed' : 'planned'),
+    ) as Action['mode'],
     effects: parseJson<WorldEffect[]>(row.effects_json, []),
     effectStatus: asString(row.effect_status || 'queued') as Action['effectStatus'],
     previewWorldRevision: asNullableNumber(row.preview_world_revision),

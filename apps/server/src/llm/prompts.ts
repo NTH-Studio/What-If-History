@@ -135,24 +135,6 @@ function compactWorldState(
 }
 
 export const prompts = {
-  actionValidation(game: Game, text: string) {
-    return {
-      system:
-        `You validate strategic orders in a grand strategy simulation whose alternate-history ` +
-        `premise is authoritative. ${authoritativeDateInstruction(game)} ${scenarioSafety} ` +
-        `An order may be reckless, hostile or destabilizing: do not reject it merely because its ` +
-        `target is currently an ally or its consequences would be severe. Reject only orders that ` +
-        `are unintelligible or physically or technologically impossible at the supplied date. ` +
-        `Return JSON only.`,
-      user: JSON.stringify({
-        date: game.currentDate,
-        nation: game.playerNation.name,
-        ...scenarioContext(game),
-        order: text,
-        output: { accepted: 'boolean', reason: 'short string' },
-      }),
-    };
-  },
   brainstorm(game: Game) {
     return {
       system:
@@ -223,15 +205,22 @@ export const prompts = {
     consolidationContext = '',
     worldState: unknown = undefined,
   ) {
+    const pendingActions = actions.filter((action) => action.status === 'pending');
+    const plannedOrders = pendingActions.filter((action) => action.mode === 'planned');
+    const imposedFacts = pendingActions.filter((action) => action.mode === 'imposed');
     return {
       system:
         `Simulate plausible strategic consequences appropriate to the supplied date inside the ` +
         `authoritative alternate-history premise. ` +
         `${authoritativeDateInstruction(game)} ${scenarioSafety} Continue the recent event history ` +
         `instead of restarting or repeating the ` +
-        `scenario. Every confirmedEffect in pendingActions is an authoritative sovereign decision ` +
-        `that the engine applies during this turn. Generate only reactions and secondary effects: ` +
-        `never cancel, reject, reverse, duplicate or condition a confirmed effect. ` +
+        `scenario. plannedOrders are attempts: decide whether each succeeds, fails or produces a ` +
+        `partial result, then simulate its consequences. imposedFacts are canonical player facts: ` +
+        `they become true during this turn regardless of plausibility. Never reject, condition, ` +
+        `reverse or reinterpret an imposed fact. guaranteedEffects are applied by the engine, so ` +
+        `generate only their reactions and secondary effects. Return every imposed fact id exactly ` +
+        `once in resolved_imposed_action_ids. Do not classify imposed text as a law merely because ` +
+        `it sounds normative; law_changes remain independent simulation outcomes. ` +
         (jump.strategy === 'next_major_event'
           ? `Stop at the first plausible major or critical event within the requested horizon and ` +
             `return its elapsed amount in time_advance_amount. If none occurs, use the full amount. `
@@ -245,8 +234,10 @@ export const prompts = {
         `population, infrastructure or habitability. A newly introduced durable public figure must ` +
         `be created in character_changes; reuse the supplied character_id on later turns rather than ` +
         `creating a duplicate. Purely incidental names need no character record. Return strict JSON only. Never invent ` +
-        `nation codes or geographic identifiers outside the supplied lists. Generate one or two ` +
-        `concise events, keep each description under 600 characters, omit unchanged state fields, ` +
+        `nation codes or geographic identifiers outside the supplied lists. Generate three to six ` +
+        `distinct, concise events that together summarize the important political, diplomatic, ` +
+        `military, economic and social developments of the elapsed period. Avoid padding the list ` +
+        `with duplicates. Keep each description under 600 characters, omit unchanged state fields, ` +
         `and leave change arrays empty unless a real change is required.`,
       user: JSON.stringify({
         currentDate: game.currentDate,
@@ -258,15 +249,16 @@ export const prompts = {
         },
         ...scenarioContext(game),
         timeJump: jump,
-        pendingActions: actions
-          .filter((action) => action.status === 'pending')
-          .slice(0, 12)
-          .map((action) => ({
-            id: action.id,
-            type: action.actionType,
-            order: action.actionText.slice(0, 800),
-            confirmedEffects: action.effects,
-          })),
+        plannedOrders: plannedOrders.slice(0, 12).map((action) => ({
+          id: action.id,
+          order: action.actionText.slice(0, 800),
+          interpretedEffects: action.effects,
+        })),
+        imposedFacts: imposedFacts.map((action) => ({
+          id: action.id,
+          fact: action.actionText.slice(0, 800),
+          guaranteedEffects: action.effects,
+        })),
         activeLaws: activeLaws
           .filter((law) => law.nationCode === game.playerNation.code)
           .slice(0, 20),
@@ -294,6 +286,7 @@ export const prompts = {
             jump.strategy === 'next_major_event'
               ? `integer from 1 to ${jump.amount}; stop at the first major event`
               : jump.amount,
+          resolved_imposed_action_ids: imposedFacts.map((action) => action.id),
           events: [
             {
               title: '1-180 chars',

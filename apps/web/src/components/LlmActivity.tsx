@@ -16,6 +16,7 @@ import { useTranslation } from 'react-i18next';
 import type { LlmActivity } from '@what-if-history/contracts';
 import { llmActivitySchema } from '@what-if-history/contracts';
 import { api } from '../api';
+import { formatTimestamp } from '../dateFormatting';
 import styles from '../styles/App.module.css';
 
 type ConnectionState = 'connecting' | 'connected' | 'disconnected';
@@ -292,10 +293,10 @@ function ActivityCard({ activity, nowSeconds }: { activity: LlmActivity; nowSeco
         <div>
           <dt>{t('llmActivity.started')}</dt>
           <dd>
-            {new Intl.DateTimeFormat(i18n.language, {
+            {formatTimestamp(activity.startedAt, i18n.language, {
               dateStyle: 'short',
               timeStyle: 'medium',
-            }).format(new Date(activity.startedAt))}
+            })}
           </dd>
         </div>
         <div>

@@ -16,6 +16,7 @@ import {
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { CinematicCue, StrategicState, TimelineEntry } from '@what-if-history/contracts';
+import { formatCalendarDate } from '../dateFormatting';
 import styles from '../styles/App.module.css';
 
 const iconForKind = (kind: TimelineEntry['kind']) => {
@@ -40,7 +41,7 @@ export function StrategicTimelineTheater({
   onNext: () => void;
   onClose: () => void;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const [paused, setPaused] = useState(false);
   const [speed, setSpeed] = useState('1');
   const [animationsSkipped, setAnimationsSkipped] = useState(false);
@@ -82,7 +83,9 @@ export function StrategicTimelineTheater({
     <section className={styles.strategicTimelineTheater} aria-live="polite">
       <header>
         <span>{t('strategic.timeline.progress', { current: index + 1, total })}</span>
-        <span>{entry.gameDate}</span>
+        <time dateTime={entry.gameDate}>
+          {formatCalendarDate(entry.gameDate, i18n.language, 'long')}
+        </time>
         <button type="button" aria-label={t('common.close')} onClick={onClose}>
           <X size={18} />
         </button>

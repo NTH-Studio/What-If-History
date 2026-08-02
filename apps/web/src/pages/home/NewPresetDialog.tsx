@@ -14,7 +14,7 @@ export function NewPresetDialog({
   onOpenChange: (open: boolean) => void;
   onCreated: (preset: Awaited<ReturnType<typeof api.createPreset>>) => void;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
   const mutation = useMutation({
     mutationFn: (form: HTMLFormElement) => {
@@ -77,7 +77,13 @@ export function NewPresetDialog({
           </label>
           <label>
             <span>{t('presets.date')}</span>
-            <input name="startDate" type="date" defaultValue="1936-01-01" required />
+            <input
+              name="startDate"
+              type="date"
+              lang={i18n.resolvedLanguage ?? i18n.language}
+              defaultValue="1936-01-01"
+              required
+            />
           </label>
         </div>
         <label>

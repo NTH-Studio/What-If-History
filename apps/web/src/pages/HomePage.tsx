@@ -10,7 +10,7 @@ import {
   Settings,
   Trash2,
 } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useHistory } from 'react-router-dom';
 import type { CreatePresetInput, Preset } from '@what-if-history/contracts';
@@ -20,6 +20,8 @@ import { BrandMark } from '../components/BrandMark';
 import { ConfirmDialog, Modal } from '../components/Dialogs';
 import { LlmActivityIndicator } from '../components/LlmActivity';
 import { StudioSupport } from '../components/StudioSupport';
+import { queueEventPlayback } from '../eventPlayback';
+import { formatCalendarDate } from '../dateFormatting';
 import { NewGameDialog } from './home/NewGameDialog';
 import { NewPresetDialog } from './home/NewPresetDialog';
 import { Message } from './home/shared';
@@ -50,16 +52,12 @@ export function HomePage() {
   const playPresetMutation = useMutation({
     mutationFn: ({ presetId, nationCode }: { presetId: string; nationCode: string }) =>
       api.playPreset(presetId, { nationCode }),
-    onSuccess: async (game) => {
+    onSuccess: async ({ game, openingTurn }) => {
+      queueEventPlayback(game.id, openingTurn.events);
       await queryClient.invalidateQueries({ queryKey: ['games'] });
-      history.push(`/game/${game.id}/dashboard`);
+      history.push(`/game/${game.id}/map`);
     },
   });
-
-  const dateFormatter = useMemo(
-    () => new Intl.DateTimeFormat(i18n.language, { dateStyle: 'long' }),
-    [i18n.language],
-  );
 
   return (
     <main className={styles.home}>
@@ -113,7 +111,9 @@ export function HomePage() {
               </div>
               <h3>{game.name}</h3>
               <p>{game.playerNationName}</p>
-              <time>{dateFormatter.format(new Date(`${game.currentDate}T00:00:00`))}</time>
+              <time dateTime={game.currentDate}>
+                {formatCalendarDate(game.currentDate, i18n.language)}
+              </time>
               <footer>
                 <button
                   className={styles.iconButton}
@@ -268,7 +268,7 @@ export function HomePage() {
             <footer className={styles.dialogActions}>
               <button className={styles.primaryButton} disabled={playPresetMutation.isPending}>
                 <Rocket size={16} />
-                {t('presets.play')}
+                {playPresetMutation.isPending ? t('newGame.simulatingFirstDay') : t('presets.play')}
               </button>
             </footer>
           </form>

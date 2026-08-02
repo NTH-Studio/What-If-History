@@ -118,6 +118,9 @@ export const worldEffectSchema = z.union([
 ]);
 export type WorldEffect = z.infer<typeof worldEffectSchema>;
 
+export const actionModeSchema = z.enum(['planned', 'imposed']);
+export type ActionMode = z.infer<typeof actionModeSchema>;
+
 export const actionEffectStatusSchema = z.enum([
   'draft',
   'resolved',
@@ -129,7 +132,6 @@ export type ActionEffectStatus = z.infer<typeof actionEffectStatusSchema>;
 
 export const actionPreviewInputSchema = z.object({
   actionText: boundedTextSchema,
-  actionType: z.enum(['general', 'diplomatic', 'military', 'economic', 'law']).default('general'),
   context: z
     .object({
       regionId: z.string().trim().min(1).max(160).optional(),
@@ -143,7 +145,6 @@ export type ActionPreviewInput = z.infer<typeof actionPreviewInputSchema>;
 
 export const actionPreviewSchema = z.object({
   actionText: boundedTextSchema,
-  actionType: z.enum(['general', 'diplomatic', 'military', 'economic', 'law']),
   effects: z.array(worldEffectSchema).max(100),
   ambiguities: z.array(
     z.object({
@@ -167,6 +168,7 @@ export const actionSchema = z.object({
   aiResponse: z.string().nullable(),
   turnNumber: z.number().int().positive(),
   createdAt: isoDateTimeSchema,
+  mode: actionModeSchema.default('planned'),
   effects: z.array(worldEffectSchema).max(100).default([]),
   effectStatus: actionEffectStatusSchema.default('queued'),
   previewWorldRevision: z.number().int().nonnegative().nullable().default(null),
@@ -175,7 +177,7 @@ export type Action = z.infer<typeof actionSchema>;
 
 export const createActionInputSchema = z.object({
   actionText: boundedTextSchema,
-  actionType: z.enum(['general', 'diplomatic', 'military', 'economic', 'law']).default('general'),
+  mode: actionModeSchema.default('planned'),
   effects: z.array(worldEffectSchema).max(100).optional(),
   previewWorldRevision: z.number().int().nonnegative().optional(),
 });
@@ -185,10 +187,3 @@ export const updateActionInputSchema = createActionInputSchema
   .refine((value) => Object.keys(value).length > 0, 'At least one action field is required');
 export type UpdateActionInput = z.infer<typeof updateActionInputSchema>;
 export const enhanceActionInputSchema = z.object({ actionText: boundedTextSchema });
-
-export const promulgateLawInputSchema = z.object({
-  actionText: boundedTextSchema,
-  effects: z.array(worldEffectSchema).max(100).optional(),
-  previewWorldRevision: z.number().int().nonnegative().optional(),
-});
-export type PromulgateLawInput = z.infer<typeof promulgateLawInputSchema>;

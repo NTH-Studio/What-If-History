@@ -409,4 +409,64 @@ describe('map position migrations', () => {
       claim_nation_codes: '["SPR"]',
     });
   });
+
+  it('migrates ordinary actions to planned and legacy laws to imposed without touching laws', () => {
+    database = new DatabaseSync(':memory:');
+    runMigrations(database, 13);
+    const timestamp = '2026-01-01T00:00:00.000Z';
+    database
+      .prepare(
+        `INSERT INTO games (
+          id, name, player_nation_code, current_date, world_context, simulation_rules,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        'action-mode-game',
+        'Modes',
+        'FRA',
+        '1936-01-01',
+        'World',
+        'Rules',
+        timestamp,
+        timestamp,
+      );
+    const insertAction = database.prepare(
+      `INSERT INTO actions (
+        id, game_id, nation_code, action_text, action_type, status, turn_number, created_at
+      ) VALUES (?, 'action-mode-game', 'FRA', ?, ?, 'pending', 1, ?)`,
+    );
+    insertAction.run('planned-action', 'Renforcer la frontière', 'military', timestamp);
+    insertAction.run('legacy-law', 'Loi héritée', 'law', timestamp);
+    database
+      .prepare(
+        `INSERT INTO country_laws (
+          id, game_id, nation_code, title_fr, title_en, summary_fr, summary_en,
+          category, enacted_date, status, source
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        'existing-law',
+        'action-mode-game',
+        'FRA',
+        'Loi existante',
+        'Existing law',
+        'Résumé',
+        'Summary',
+        'other',
+        '1936-01-01',
+        'active',
+        'historical',
+      );
+
+    runMigrations(database, 14);
+
+    expect(database.prepare('SELECT id, action_mode FROM actions ORDER BY id').all()).toEqual([
+      { id: 'legacy-law', action_mode: 'imposed' },
+      { id: 'planned-action', action_mode: 'planned' },
+    ]);
+    expect(database.prepare('SELECT id, title_fr, status FROM country_laws').all()).toEqual([
+      { id: 'existing-law', title_fr: 'Loi existante', status: 'active' },
+    ]);
+  });
 });

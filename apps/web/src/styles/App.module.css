@@ -347,7 +347,6 @@
     0 34px 100px rgba(0, 0, 0, 0.52),
     inset 0 1px rgba(255, 255, 255, 0.03);
   transform: translate(-50%, -50%);
-  animation: dialogIn 180ms ease;
 }
 
 .dialog > h2,
@@ -868,7 +867,6 @@
     var(--surface-solid);
   border-left: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border));
   box-shadow: -28px 0 80px rgba(0, 0, 0, 0.4);
-  animation: activityPanelIn 180ms ease;
 }
 
 .activityPanelHeader {
@@ -1068,13 +1066,6 @@
 @keyframes activitySpin {
   to {
     transform: rotate(360deg);
-  }
-}
-
-@keyframes activityPanelIn {
-  from {
-    transform: translateX(24px);
-    opacity: 0;
   }
 }
 
@@ -1549,9 +1540,21 @@
   gap: 10px;
 }
 
-.lawButton {
-  color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 48%, var(--border));
+.actionModeHelp {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  color: var(--muted);
+  font-size: 0.68rem;
+  line-height: 1.35;
+}
+
+.actionModeHelp p {
+  margin: 0;
+}
+
+.actionModeHelp strong {
+  color: var(--text);
 }
 
 .actionPreview {
@@ -1834,6 +1837,7 @@
 }
 
 .eventTimeline header span,
+.eventTimeline header time,
 .eventTimeline small {
   color: var(--muted);
   font-family: var(--mono);
@@ -2972,6 +2976,7 @@
 }
 
 .countryLawList header span,
+.countryLawList header time,
 .countryLawList small {
   color: var(--muted);
   font-family: var(--mono);
@@ -3221,6 +3226,48 @@
     0 36px 110px rgba(0, 0, 0, 0.56),
     inset 0 1px rgba(255, 255, 255, 0.03);
   backdrop-filter: blur(24px) saturate(118%);
+  animation: eventTheaterEnter 420ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.eventTheater > * {
+  animation: eventTheaterContentEnter 360ms ease-out both;
+}
+
+.eventTheater > :nth-child(2) {
+  animation-delay: 70ms;
+}
+
+.eventTheater > :nth-child(3),
+.eventTheater > :nth-child(4) {
+  animation-delay: 120ms;
+}
+
+.eventTheater > :nth-child(n + 5) {
+  animation-delay: 170ms;
+}
+
+@keyframes eventTheaterEnter {
+  from {
+    opacity: 0;
+    transform: translateY(28px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes eventTheaterContentEnter {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .eventTheaterHeader,
@@ -3244,6 +3291,7 @@
 }
 
 .eventTheaterHeader span,
+.eventTheaterHeader time,
 .eventTheaterMeta > span {
   color: var(--muted);
   font-family: var(--mono);
@@ -3393,13 +3441,6 @@
 @keyframes fadeIn {
   from {
     opacity: 0;
-  }
-}
-
-@keyframes dialogIn {
-  from {
-    opacity: 0;
-    transform: translate(-50%, calc(-50% + 12px)) scale(0.98);
   }
 }
 
@@ -4029,20 +4070,6 @@
   gap: 8px;
 }
 
-.commandForm .commandTypeField {
-  width: 140px;
-  max-width: none;
-  min-width: 0;
-}
-
-.commandTypeField select {
-  width: 100%;
-  min-width: 0;
-  min-height: 36px;
-  padding: 7px 9px;
-  font-size: 0.73rem;
-}
-
 .commandActions {
   display: grid;
   width: 100%;
@@ -4525,10 +4552,6 @@
     grid-template-columns: 1fr;
   }
 
-  .commandForm .commandTypeField {
-    width: 128px;
-  }
-
   .commandActions .button,
   .commandActions .primaryButton {
     padding-inline: 5px;
@@ -4538,6 +4561,10 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .actionModeHelp {
+    grid-template-columns: 1fr;
   }
 
   .campaignDeck[data-section='dashboard'] {
@@ -4605,6 +4632,11 @@
   .eventTheater,
   .gameDrawer {
     transition: none;
+  }
+
+  .eventTheater,
+  .eventTheater > * {
+    animation: none;
   }
 }
 
@@ -5124,8 +5156,8 @@ article[data-status='failed'] .historyStatus > svg {
   position: absolute;
   z-index: 520;
   bottom: 16px;
-  right: 18px;
-  left: auto;
+  right: auto;
+  left: 18px;
   display: flex;
   gap: 2px;
   padding: 3px;
@@ -5134,9 +5166,7 @@ article[data-status='failed'] .historyStatus > svg {
   border-radius: 8px;
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.3);
   backdrop-filter: blur(14px);
-  transition:
-    right 180ms ease,
-    bottom 180ms ease;
+  transition: bottom 180ms ease;
 }
 
 .mapControls button {
@@ -5170,10 +5200,6 @@ article[data-status='failed'] .historyStatus > svg {
 .mapControls .mapClaimsControl[aria-pressed='true'] {
   color: var(--surface-deep);
   background: var(--accent);
-}
-
-.mapWorkspace[data-surface='dock'] .mapControls {
-  right: calc(min(460px, calc(100% - 32px)) + 32px);
 }
 
 .mapWorkspace[data-surface='deck'] .mapControls,
@@ -5440,17 +5466,25 @@ article[data-status='failed'] .historyStatus > svg {
   }
 
   .mapControls {
-    right: 10px;
+    right: auto;
     bottom: calc(74px + env(safe-area-inset-bottom));
+    left: 10px;
   }
 
   .mapWorkspace[data-surface='dock'] .mapControls,
   .mapWorkspace[data-surface='deck'] .mapControls,
   .mapWorkspace[data-surface='workspace'] .mapControls {
     top: 14px;
-    right: 14px;
+    right: auto;
     bottom: auto;
-    left: auto;
+    left: 10px;
+  }
+
+  .mapWorkspace[data-surface='dock'] .strategicLayerControl > div,
+  .mapWorkspace[data-surface='deck'] .strategicLayerControl > div,
+  .mapWorkspace[data-surface='workspace'] .strategicLayerControl > div {
+    top: calc(100% + 8px);
+    bottom: auto;
   }
 
   .mobileBottomNav {
@@ -6558,24 +6592,9 @@ article[data-status='failed'] .historyStatus > svg {
 
 /* Grand strategy command layer */
 .strategicLayerControl {
-  position: absolute;
-  z-index: 720;
-  top: auto;
-  right: 18px;
-  bottom: 76px;
-  display: grid;
-  justify-items: end;
-  gap: 8px;
-  pointer-events: none;
-}
-
-.mapWorkspace[data-surface='dock'] .strategicLayerControl {
-  right: calc(min(460px, calc(100% - 32px)) + 32px);
-}
-
-.mapWorkspace[data-surface='deck'] .strategicLayerControl,
-.mapWorkspace[data-surface='workspace'] .strategicLayerControl {
-  bottom: min(calc(42vh + 92px), 652px);
+  position: relative;
+  z-index: 1;
+  display: block;
 }
 
 .strategicLayerControl button {
@@ -6600,10 +6619,28 @@ article[data-status='failed'] .historyStatus > svg {
   border-radius: 10px;
 }
 
+.mapControls .strategicLayerToggle {
+  width: 44px;
+  height: 44px;
+  min-height: 44px;
+  padding: 0;
+  justify-content: center;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+}
+
+.mapControls .strategicLayerToggle span {
+  display: none;
+}
+
 .strategicLayerControl > div {
   position: absolute;
-  right: 0;
+  right: auto;
   bottom: calc(100% + 8px);
+  left: 0;
   display: grid;
   grid-template-columns: repeat(3, minmax(112px, 1fr));
   gap: 5px;
@@ -7064,15 +7101,9 @@ article[data-status='failed'] .historyStatus > svg {
 }
 
 @media (max-width: 720px) {
-  .strategicLayerControl {
-    top: auto;
-    right: 10px;
-    bottom: calc(134px + env(safe-area-inset-bottom));
-  }
-  .strategicLayerToggle span {
-    display: none;
-  }
   .strategicLayerControl > div {
+    right: -10px;
+    left: auto;
     grid-template-columns: repeat(2, minmax(120px, 1fr));
     max-width: calc(100vw - 20px);
   }
@@ -7132,7 +7163,7 @@ article[data-status='failed'] .historyStatus > svg {
   text-transform: uppercase;
 }
 
-.strategicTimelineTheater > header span:nth-child(2) {
+.strategicTimelineTheater > header :is(span, time):nth-child(2) {
   margin-left: auto;
 }
 
@@ -7350,6 +7381,7 @@ article[data-status='failed'] .historyStatus > svg {
 }
 
 .strategicJournal article > span,
+.strategicJournal article > time,
 .strategicJournal article small {
   color: var(--muted);
   font: 700 9px/1 var(--font-mono);
@@ -7576,7 +7608,7 @@ article[data-status='failed'] .historyStatus > svg {
   .strategicJournal article {
     grid-template-columns: 1fr auto;
   }
-  .strategicJournal article > span {
+  .strategicJournal article > :is(span, time) {
     grid-column: 1 / -1;
   }
   .timelineReplayButton {
@@ -7908,5 +7940,409 @@ article[data-status='failed'] .historyStatus > svg {
   .kofiLink {
     justify-content: center;
     width: 100%;
+  }
+}
+
+/* World journal: compact master list and one focused detail at a time. */
+.campaignDock[data-section='events'] {
+  bottom: 14px;
+  height: auto;
+  max-height: none;
+  padding: 0;
+  overflow: hidden;
+}
+
+@media (min-width: 900px) {
+  :global(html[data-desktop-layout='atlas']) .campaignDock[data-section='events'] {
+    bottom: 18px;
+    height: auto;
+    max-height: none;
+  }
+}
+
+.campaignDock[data-section='events'] .worldJournal {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+  gap: 0;
+  margin: 0;
+}
+
+.journalTopbar {
+  z-index: 4;
+  flex: 0 0 auto;
+  background: color-mix(in srgb, var(--surface-solid) 98%, transparent);
+  border-bottom: 1px solid var(--border);
+}
+
+.campaignDock[data-section='events'] .journalTopbar .workspaceHeader {
+  min-height: 82px;
+  margin: 0;
+  padding: 16px 16px 10px;
+}
+
+.journalTabs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  padding: 0 12px 12px;
+}
+
+.journalTabs > button {
+  display: flex;
+  min-width: 0;
+  min-height: 44px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 11px;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.journalTabs > button strong {
+  min-width: 24px;
+  padding: 4px 6px;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--surface-raised) 88%, transparent);
+  border-radius: 999px;
+  font: 700 0.66rem/1 var(--mono);
+  text-align: center;
+}
+
+.journalTabs > button[aria-selected='true'] {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 11%, var(--surface-raised));
+  border-color: color-mix(in srgb, var(--accent) 46%, var(--border));
+}
+
+.journalTabs > button[aria-selected='true'] strong {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.journalContent {
+  min-height: 0;
+  flex: 1 1 auto;
+  padding: 12px 14px 18px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-color: color-mix(in srgb, var(--cyan) 34%, var(--border)) transparent;
+  scrollbar-width: thin;
+}
+
+.journalList {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.journalList > li {
+  min-width: 0;
+}
+
+.journalList > li > button {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  min-height: 66px;
+  grid-template-columns: 4px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 11px;
+  color: var(--text);
+  text-align: left;
+  background: color-mix(in srgb, var(--surface-solid) 82%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition:
+    border-color 140ms ease,
+    background 140ms ease;
+}
+
+.journalList > li > button:hover,
+.journalList > li > button:focus-visible {
+  background: color-mix(in srgb, var(--cyan) 7%, var(--surface-solid));
+  border-color: color-mix(in srgb, var(--cyan) 46%, var(--border));
+}
+
+.journalList > li > button > svg {
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+
+.journalSeverity,
+.journalOperationMarker {
+  width: 4px;
+  height: 38px;
+  align-self: stretch;
+  background: var(--cyan);
+  border-radius: 999px;
+}
+
+.journalSeverity[data-severity='minor'] {
+  background: #7aa584;
+}
+
+.journalSeverity[data-severity='moderate'] {
+  background: #d1a851;
+}
+
+.journalSeverity[data-severity='major'] {
+  background: #d5754e;
+}
+
+.journalSeverity[data-severity='critical'] {
+  background: #d34f55;
+}
+
+.journalList button[data-kind='battle'] .journalOperationMarker,
+.journalList button[data-kind='impact'] .journalOperationMarker {
+  background: #d76549;
+}
+
+.journalEntryCopy {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+}
+
+.journalEntryMeta {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 5px 8px;
+  color: var(--muted);
+  font: 700 0.61rem/1.2 var(--mono);
+  letter-spacing: 0.035em;
+  text-transform: uppercase;
+}
+
+.journalEntryMeta > :not(:last-child)::after {
+  margin-left: 8px;
+  color: var(--border-strong);
+  content: '·';
+}
+
+.journalEntryCopy > strong {
+  overflow: hidden;
+  font-size: 0.83rem;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.journalDetail {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+  padding: 2px 2px 18px;
+}
+
+.journalBack {
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
+  justify-self: start;
+  gap: 6px;
+  padding: 7px 10px;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.journalBack:hover,
+.journalBack:focus-visible {
+  color: var(--text);
+  background: var(--surface-raised);
+  border-color: var(--border);
+}
+
+.journalDetailMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  color: var(--muted);
+  font: 700 0.64rem/1.2 var(--mono);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.journalDetailMeta > span,
+.journalDetailMeta > time {
+  padding: 5px 7px;
+  background: color-mix(in srgb, var(--surface-raised) 88%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+
+.journalDetail h2 {
+  margin: 0;
+  font-family: var(--display);
+  font-size: clamp(1.35rem, 2vw, 1.75rem);
+  font-weight: 550;
+  line-height: 1.12;
+}
+
+.journalDetail h2:focus {
+  outline: none;
+}
+
+.journalDetail > p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.91rem;
+  line-height: 1.65;
+}
+
+.journalAffected {
+  display: grid;
+  gap: 5px;
+  padding: 11px 12px;
+  background: color-mix(in srgb, var(--surface-raised) 86%, transparent);
+  border-left: 3px solid var(--cyan);
+  border-radius: 6px;
+}
+
+.journalAffected span {
+  color: var(--muted);
+  font: 700 0.62rem/1.2 var(--mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.journalAffected strong {
+  font-size: 0.84rem;
+}
+
+.journalDetailActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-top: 4px;
+}
+
+.journalDetailActions .button,
+.journalDetailActions .primaryButton,
+.journalDetailActions .textDanger {
+  min-height: 44px;
+  margin: 0;
+  padding: 9px 12px;
+  font-size: 0.75rem;
+}
+
+.journalDetailActions .textDanger {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.journalDetail .timelineReplayButton,
+.journalDetailActions .timelineReplayButton {
+  width: auto;
+  min-width: 0;
+  padding: 9px 12px;
+}
+
+.journalDetail .timelineReplayButton span {
+  display: inline;
+}
+
+.journalChanges {
+  display: grid;
+  gap: 10px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.journalChanges > header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.journalChanges > header h3 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.journalChanges > header span {
+  color: var(--muted);
+  font: 700 0.62rem/1.2 var(--mono);
+}
+
+.journalEmpty {
+  margin: 0;
+  padding: 28px 16px;
+  color: var(--muted);
+  text-align: center;
+}
+
+@media (max-width: 899px) {
+  .campaignDock[data-section='events'] {
+    top: auto;
+    bottom: calc(74px + env(safe-area-inset-bottom));
+    height: min(58dvh, 620px);
+    max-height: 62dvh;
+  }
+
+  .campaignDock[data-section='events'] .worldJournal {
+    height: 100%;
+  }
+}
+
+@media (max-width: 520px) {
+  .campaignDock[data-section='events'] .journalTopbar .workspaceHeader {
+    min-height: 72px;
+    padding: 12px 12px 8px;
+  }
+
+  .journalTabs {
+    padding: 0 8px 8px;
+  }
+
+  .journalContent {
+    padding: 8px 8px 14px;
+  }
+
+  .journalList > li > button {
+    min-height: 62px;
+    gap: 8px;
+    padding: 9px;
+  }
+
+  .journalEntryCopy > strong {
+    font-size: 0.8rem;
+  }
+
+  .journalEntryMeta {
+    gap: 4px 6px;
+    font-size: 0.56rem;
+  }
+
+  .journalEntryMeta > :not(:last-child)::after {
+    margin-left: 6px;
+  }
+
+  .journalDetail {
+    gap: 13px;
+  }
+
+  .journalDetailActions > * {
+    flex: 1 1 auto;
   }
 }

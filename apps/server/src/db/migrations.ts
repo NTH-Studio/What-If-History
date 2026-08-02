@@ -800,6 +800,15 @@ const migrations = [
       WHERE region_id = 'Gibraltar';
     `,
   },
+  {
+    version: 14,
+    name: 'planned_and_imposed_actions',
+    sql: `
+      ALTER TABLE actions ADD COLUMN action_mode TEXT NOT NULL DEFAULT 'planned'
+        CHECK(action_mode IN ('planned', 'imposed'));
+      UPDATE actions SET action_mode = 'imposed' WHERE action_type = 'law';
+    `,
+  },
 ] as const;
 
 export function runMigrations(database: DatabaseSync, targetVersion = Number.POSITIVE_INFINITY) {

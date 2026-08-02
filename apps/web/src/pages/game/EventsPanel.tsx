@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { MapPin, Pencil, Trash2, X } from 'lucide-react';
-import { Fragment, useMemo, useState } from 'react';
+import { ChevronLeft, ChevronRight, MapPin, Pencil, Trash2, X } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type {
   AppliedMutation,
@@ -9,10 +9,14 @@ import type {
   TimelineEntry,
 } from '@what-if-history/contracts';
 import { api } from '../../api';
+import { formatCalendarDate } from '../../dateFormatting';
 import { ConfirmDialog, Modal } from '../../components/Dialogs';
 import { TimelineReplayButton } from '../../components/StrategicTimeline';
 import { TurnMutationSummary } from './TurnMutationSummary';
 import styles from '../../styles/App.module.css';
+
+type JournalTab = 'news' | 'operations';
+type JournalSelection = { kind: 'event'; id: string } | { kind: 'operation'; id: string };
 
 export function EventsPanel({
   gameId,
@@ -33,14 +37,20 @@ export function EventsPanel({
   onFocusMutation: (mutation: AppliedMutation) => void;
   onClose: () => void;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
+  const [activeTab, setActiveTab] = useState<JournalTab>('news');
+  const [selection, setSelection] = useState<JournalSelection>();
   const [editing, setEditing] = useState<(typeof events)[number]>();
   const [editLocationKind, setEditLocationKind] = useState<'region' | 'nation' | 'global'>(
     'global',
   );
   const [editLocationId, setEditLocationId] = useState('');
   const [deleting, setDeleting] = useState<string>();
+  const detailHeadingRef = useRef<HTMLHeadingElement>(null);
+  const entryRefs = useRef(new Map<string, HTMLButtonElement>());
+  const returnFocusKeyRef = useRef<string | undefined>(undefined);
+  const shouldRestoreFocusRef = useRef(false);
   const regions = useQuery({
     queryKey: ['game-regions', gameId],
     queryFn: () => api.gameRegions(gameId),
@@ -55,14 +65,41 @@ export function EventsPanel({
     }
     return result;
   }, [mutations]);
-  const lastEntryByTurn = useMemo(() => {
-    const result = new Map<number, TimelineEntry>();
-    for (const entry of timeline) {
-      const current = result.get(entry.turnNumber);
-      if (!current || entry.sequence > current.sequence) result.set(entry.turnNumber, entry);
+  const selectedEvent =
+    selection?.kind === 'event' ? events.find((event) => event.id === selection.id) : undefined;
+  const selectedOperation =
+    selection?.kind === 'operation'
+      ? timeline.find((entry) => entry.id === selection.id)
+      : undefined;
+
+  useEffect(() => {
+    if (selection) {
+      detailHeadingRef.current?.focus();
+      return;
     }
-    return new Map([...result].map(([turnNumber, entry]) => [turnNumber, entry.id]));
-  }, [timeline]);
+    if (!shouldRestoreFocusRef.current) return;
+    shouldRestoreFocusRef.current = false;
+    const key = returnFocusKeyRef.current;
+    if (key) entryRefs.current.get(key)?.focus();
+  }, [selection]);
+
+  const selectTab = (tab: JournalTab) => {
+    setActiveTab(tab);
+    setSelection(undefined);
+    shouldRestoreFocusRef.current = false;
+  };
+  const openEntry = (nextSelection: JournalSelection) => {
+    returnFocusKeyRef.current = `${nextSelection.kind}:${nextSelection.id}`;
+    setSelection(nextSelection);
+  };
+  const returnToList = () => {
+    shouldRestoreFocusRef.current = true;
+    setSelection(undefined);
+  };
+  const registerEntry = (key: string, element: HTMLButtonElement | null) => {
+    if (element) entryRefs.current.set(key, element);
+    else entryRefs.current.delete(key);
+  };
   const beginEditing = (event: (typeof events)[number]) => {
     const location =
       event.map_cue.locations.find((item) => item.role === 'primary') ?? event.map_cue.locations[0];
@@ -115,6 +152,7 @@ export function EventsPanel({
     mutationFn: (id: string) => api.deleteEvent(gameId, id),
     onSuccess: async () => {
       setDeleting(undefined);
+      setSelection(undefined);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['events', gameId] }),
         queryClient.invalidateQueries({ queryKey: ['consolidations', gameId] }),
@@ -122,100 +160,208 @@ export function EventsPanel({
     },
   });
   return (
-    <div className={styles.pageStack}>
-      <header className={`${styles.workspaceHeader} ${styles.surfaceHeader}`}>
-        <div>
-          <p className={styles.eyebrow}>WORLD · FEED</p>
-          <h1>{t('events.title')}</h1>
-        </div>
-        <div className={styles.surfaceHeaderActions}>
-          <button
-            type="button"
-            className={styles.surfaceClose}
-            aria-label={t('common.close')}
-            onClick={onClose}
-          >
-            <X size={18} />
-          </button>
-        </div>
-      </header>
-      {timeline.length ? (
-        <section className={styles.strategicJournal} aria-labelledby="strategic-journal-title">
-          <header>
-            <div>
-              <p className={styles.eyebrow}>WORLD · OPERATIONS</p>
-              <h2 id="strategic-journal-title">{t('strategic.timeline.journal')}</h2>
-            </div>
-            <span>{timeline.length}</span>
-          </header>
+    <div className={`${styles.pageStack} ${styles.worldJournal}`}>
+      <div className={styles.journalTopbar}>
+        <header className={`${styles.workspaceHeader} ${styles.surfaceHeader}`}>
           <div>
-            {timeline.map((entry) => {
-              const details = turnDetails.get(entry.turnNumber) ?? [];
-              const showsTurnDetails = lastEntryByTurn.get(entry.turnNumber) === entry.id;
-              return (
-                <Fragment key={entry.id}>
-                  <article data-kind={entry.kind}>
-                    <span>{entry.gameDate}</span>
-                    <div>
-                      <small>{t(`strategic.timeline.kinds.${entry.kind}`)}</small>
-                      <h3>{entry.title}</h3>
-                      <p>{entry.description}</p>
-                    </div>
-                    <TimelineReplayButton entry={entry} onReplay={() => onReplayTimeline(entry)} />
-                  </article>
-                  {showsTurnDetails && details.length ? (
-                    <details className={styles.strategicTurnDetails}>
-                      <summary>
-                        <span>{t('turnSummary.details')}</span>
-                        <small>{t('turnSummary.changes', { count: details.length })}</small>
-                      </summary>
-                      <TurnMutationSummary mutations={details} onFocus={onFocusMutation} />
-                    </details>
-                  ) : null}
-                </Fragment>
-              );
-            })}
+            <p className={styles.eyebrow}>WORLD · FEED</p>
+            <h1>{t('events.title')}</h1>
           </div>
-        </section>
-      ) : null}
-      <div className={styles.eventTimeline}>
-        {events.map((event) => (
-          <article key={event.id}>
-            <div className={styles.timelineRail}>
-              <span data-severity={event.severity} />
+          <div className={styles.surfaceHeaderActions}>
+            <button
+              type="button"
+              className={styles.surfaceClose}
+              aria-label={t('common.close')}
+              onClick={onClose}
+            >
+              <X size={18} />
+            </button>
+          </div>
+        </header>
+        <div
+          className={styles.journalTabs}
+          role="tablist"
+          aria-label={t('events.tabsLabel')}
+          onKeyDown={(event) => {
+            if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+            event.preventDefault();
+            const nextTab = activeTab === 'news' ? 'operations' : 'news';
+            selectTab(nextTab);
+            globalThis.document.getElementById(`journal-tab-${nextTab}`)?.focus();
+          }}
+        >
+          {(['news', 'operations'] as const).map((tab) => {
+            const count = tab === 'news' ? events.length : timeline.length;
+            return (
+              <button
+                type="button"
+                role="tab"
+                id={`journal-tab-${tab}`}
+                key={tab}
+                aria-selected={activeTab === tab}
+                aria-controls={`journal-panel-${tab}`}
+                tabIndex={activeTab === tab ? 0 : -1}
+                onClick={() => selectTab(tab)}
+              >
+                <span>{t(`events.tabs.${tab}`)}</span>
+                <strong>{count}</strong>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      <section
+        className={styles.journalContent}
+        role="tabpanel"
+        id={`journal-panel-${activeTab}`}
+        aria-labelledby={`journal-tab-${activeTab}`}
+        data-testid="journal-content"
+      >
+        {selectedEvent ? (
+          <article className={styles.journalDetail} data-testid="journal-detail">
+            <button type="button" className={styles.journalBack} onClick={returnToList}>
+              <ChevronLeft size={17} />
+              {t('common.back')}
+            </button>
+            <div className={styles.journalDetailMeta}>
+              <time dateTime={selectedEvent.gameDate}>
+                {formatCalendarDate(selectedEvent.gameDate, i18n.language, 'long')}
+              </time>
+              <span>{t(`events.types.${selectedEvent.event_type}`)}</span>
+              <span data-severity={selectedEvent.severity}>
+                {t(`events.severities.${selectedEvent.severity}`)}
+              </span>
             </div>
-            <div>
-              <header>
-                <span>{event.gameDate}</span>
-                <span>{event.event_type}</span>
-                <span>{event.severity}</span>
-              </header>
-              <h2>{event.title}</h2>
-              <p>{event.description}</p>
-              {event.affected_nations.length ? (
-                <small>
-                  {t('events.affected')}: {event.affected_nations.join(', ')}
-                </small>
-              ) : null}
-              <div className={styles.cardActions}>
-                <button className={styles.primaryButton} onClick={() => onReplay(event)}>
-                  <MapPin size={15} />
-                  {t('events.showOnMap')}
-                </button>
-                <button className={styles.button} onClick={() => beginEditing(event)}>
-                  <Pencil size={15} />
-                  {t('common.edit')}
-                </button>
-                <button className={styles.textDanger} onClick={() => setDeleting(event.id)}>
-                  <Trash2 size={15} />
-                  {t('common.delete')}
-                </button>
+            <h2 ref={detailHeadingRef} tabIndex={-1}>
+              {selectedEvent.title}
+            </h2>
+            <p>{selectedEvent.description}</p>
+            {selectedEvent.affected_nations.length ? (
+              <div className={styles.journalAffected}>
+                <span>{t('events.affected')}</span>
+                <strong>{selectedEvent.affected_nations.join(', ')}</strong>
               </div>
+            ) : null}
+            <div className={styles.journalDetailActions}>
+              <button className={styles.primaryButton} onClick={() => onReplay(selectedEvent)}>
+                <MapPin size={15} />
+                {t('events.showOnMap')}
+              </button>
+              <button className={styles.button} onClick={() => beginEditing(selectedEvent)}>
+                <Pencil size={15} />
+                {t('common.edit')}
+              </button>
+              <button className={styles.textDanger} onClick={() => setDeleting(selectedEvent.id)}>
+                <Trash2 size={15} />
+                {t('common.delete')}
+              </button>
             </div>
           </article>
-        ))}
-        {events.length === 0 ? <p className={styles.muted}>{t('game.noEvents')}</p> : null}
-      </div>
+        ) : selectedOperation ? (
+          <article className={styles.journalDetail} data-testid="journal-detail">
+            <button type="button" className={styles.journalBack} onClick={returnToList}>
+              <ChevronLeft size={17} />
+              {t('common.back')}
+            </button>
+            <div className={styles.journalDetailMeta}>
+              <time dateTime={selectedOperation.gameDate}>
+                {formatCalendarDate(selectedOperation.gameDate, i18n.language, 'long')}
+              </time>
+              <span>{t(`strategic.timeline.kinds.${selectedOperation.kind}`)}</span>
+            </div>
+            <h2 ref={detailHeadingRef} tabIndex={-1}>
+              {selectedOperation.title}
+            </h2>
+            <p>{selectedOperation.description}</p>
+            <div className={styles.journalDetailActions}>
+              <TimelineReplayButton
+                entry={selectedOperation}
+                onReplay={() => onReplayTimeline(selectedOperation)}
+              />
+            </div>
+            {(turnDetails.get(selectedOperation.turnNumber)?.length ?? 0) > 0 ? (
+              <section className={styles.journalChanges} aria-labelledby="journal-changes-title">
+                <header>
+                  <h3 id="journal-changes-title">{t('turnSummary.details')}</h3>
+                  <span>
+                    {t('turnSummary.changes', {
+                      count: turnDetails.get(selectedOperation.turnNumber)?.length ?? 0,
+                    })}
+                  </span>
+                </header>
+                <TurnMutationSummary
+                  mutations={turnDetails.get(selectedOperation.turnNumber) ?? []}
+                  onFocus={onFocusMutation}
+                />
+              </section>
+            ) : null}
+          </article>
+        ) : activeTab === 'news' ? (
+          events.length ? (
+            <ul className={styles.journalList} aria-label={t('events.tabs.news')}>
+              {events.map((event) => (
+                <li key={event.id}>
+                  <button
+                    type="button"
+                    ref={(element) => registerEntry(`event:${event.id}`, element)}
+                    data-journal-entry="event"
+                    onClick={() => openEntry({ kind: 'event', id: event.id })}
+                    aria-label={t('events.openEntry', { title: event.title })}
+                  >
+                    <span className={styles.journalSeverity} data-severity={event.severity} />
+                    <span className={styles.journalEntryCopy}>
+                      <span className={styles.journalEntryMeta}>
+                        <time dateTime={event.gameDate}>
+                          {formatCalendarDate(event.gameDate, i18n.language, 'medium')}
+                        </time>
+                        <span>{t(`events.types.${event.event_type}`)}</span>
+                        <span>{t(`events.severities.${event.severity}`)}</span>
+                      </span>
+                      <strong>{event.title}</strong>
+                    </span>
+                    <ChevronRight size={17} aria-hidden="true" />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className={styles.journalEmpty}>{t('game.noEvents')}</p>
+          )
+        ) : timeline.length ? (
+          <ul className={styles.journalList} aria-label={t('events.tabs.operations')}>
+            {timeline.map((entry) => (
+              <li key={entry.id}>
+                <button
+                  type="button"
+                  ref={(element) => registerEntry(`operation:${entry.id}`, element)}
+                  data-journal-entry="operation"
+                  data-kind={entry.kind}
+                  data-has-changes={
+                    (turnDetails.get(entry.turnNumber)?.length ?? 0) > 0 ? 'true' : 'false'
+                  }
+                  onClick={() => openEntry({ kind: 'operation', id: entry.id })}
+                  aria-label={t('events.openEntry', { title: entry.title })}
+                >
+                  <span className={styles.journalOperationMarker} />
+                  <span className={styles.journalEntryCopy}>
+                    <span className={styles.journalEntryMeta}>
+                      <time dateTime={entry.gameDate}>
+                        {formatCalendarDate(entry.gameDate, i18n.language, 'medium')}
+                      </time>
+                      <span>{t(`strategic.timeline.kinds.${entry.kind}`)}</span>
+                    </span>
+                    <strong>{entry.title}</strong>
+                  </span>
+                  <ChevronRight size={17} aria-hidden="true" />
+                </button>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className={styles.journalEmpty}>{t('events.noOperations')}</p>
+        )}
+      </section>
       <Modal
         open={Boolean(editing)}
         onOpenChange={(open) => !open && setEditing(undefined)}

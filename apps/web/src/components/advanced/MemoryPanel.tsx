@@ -4,12 +4,13 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { Consolidation } from '@what-if-history/contracts';
 import { api } from '../../api';
+import { formatCalendarDate } from '../../dateFormatting';
 import { ConfirmDialog, Modal } from '../Dialogs';
 import { PageHeader } from './shared';
 import styles from '../../styles/App.module.css';
 
 export function MemoryPanel({ gameId }: { gameId: string }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
   const snapshots = useQuery({
     queryKey: ['snapshots', gameId],
@@ -81,7 +82,10 @@ export function MemoryPanel({ gameId }: { gameId: string }) {
                 <div>
                   <strong>{snapshot.label}</strong>
                   <span>
-                    {snapshot.gameDate} · {t('game.turn', { turn: snapshot.turnNumber })}
+                    <time dateTime={snapshot.gameDate}>
+                      {formatCalendarDate(snapshot.gameDate, i18n.language, 'medium')}
+                    </time>{' '}
+                    · {t('game.turn', { turn: snapshot.turnNumber })}
                   </span>
                 </div>
                 <button className={styles.button} onClick={() => setRestoreId(snapshot.id)}>

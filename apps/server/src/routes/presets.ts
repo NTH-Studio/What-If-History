@@ -5,11 +5,18 @@ import {
   nationCodeSchema,
   updatePresetInputSchema,
 } from '@what-if-history/contracts';
+import { randomUUID } from 'node:crypto';
 import { AppError } from '../errors.js';
-import { parseUuid, requestLanguage, type ApiRouteContext } from './context.js';
+import {
+  parseUuid,
+  requestClientId,
+  requestId,
+  requestLanguage,
+  type ApiRouteContext,
+} from './context.js';
 
 export function registerPresetRoutes(router: Router, context: ApiRouteContext) {
-  const { dependencies } = context;
+  const { dependencies, llmLimiter } = context;
   router.get('/presets', (_req, res) => {
     res.json(dependencies.advanced.listPresets());
   });
@@ -50,7 +57,8 @@ export function registerPresetRoutes(router: Router, context: ApiRouteContext) {
     const gameId = req.query.gameId === undefined ? undefined : parseUuid(req.query.gameId);
     res.json(dependencies.advanced.previewPreset(parseUuid(req.params.presetId), gameId));
   });
-  router.post('/presets/:presetId/play', (req, res) => {
+  router.post('/presets/:presetId/play', llmLimiter, async (req, res) => {
+    const language = requestLanguage(req);
     const preset = dependencies.advanced.getPreset(parseUuid(req.params.presetId));
     const nationCode = nationCodeSchema.parse(req.body?.nationCode);
     if (!preset.playableNationCodes.includes(nationCode)) {
@@ -65,17 +73,32 @@ export function registerPresetRoutes(router: Router, context: ApiRouteContext) {
         presetId: preset.id,
         scenario: { mode: 'custom', premise: preset.worldContext },
       }),
-      requestLanguage(req),
+      language,
     );
-    dependencies.advanced.applyPresetInitialWorld(game.id, preset.initialWorld);
-    res
-      .status(201)
-      .json(
-        dependencies.repository.updateGameConfig(
-          game.id,
-          { simulationRules: preset.simulationRules, aiModels: preset.aiModels },
-          requestLanguage(req),
-        ),
+    try {
+      dependencies.advanced.applyPresetInitialWorld(game.id, preset.initialWorld);
+      dependencies.repository.updateGameConfig(
+        game.id,
+        { simulationRules: preset.simulationRules, aiModels: preset.aiModels },
+        language,
       );
+      dependencies.strategic.ensureGame(game.id);
+      const openingTurn = await dependencies.turns.advance(
+        game.id,
+        { amount: 1, unit: 'day' },
+        { requestId: requestId(res), clientId: requestClientId(req) },
+        randomUUID(),
+        language,
+      );
+      const launchedGame = dependencies.repository.getGame(game.id, language);
+      res.status(201).json({
+        ...launchedGame,
+        game: launchedGame,
+        openingTurn,
+      });
+    } catch (error) {
+      dependencies.repository.deleteGame(game.id);
+      throw error;
+    }
   });
 }

@@ -4,6 +4,7 @@ import { ArrowLeftRight, Landmark, MessageSquare, Scale, Search, X } from 'lucid
 import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../api';
+import { formatCalendarDate } from '../dateFormatting';
 import styles from '../styles/App.module.css';
 
 type SortKey = 'name' | 'population' | 'gdp' | 'happiness';
@@ -337,7 +338,10 @@ function CountryProfileView({
                 </header>
                 <p>{law.summary}</p>
                 <small>
-                  {t(`countries.lawSources.${law.source}`)} · {law.enactedDate}
+                  {t(`countries.lawSources.${law.source}`)} ·{' '}
+                  <time dateTime={law.enactedDate}>
+                    {formatCalendarDate(law.enactedDate, i18n.language, 'medium')}
+                  </time>
                   {law.status === 'repealed' ? ` · ${t('countries.repealed')}` : ''}
                 </small>
               </article>
@@ -364,7 +368,9 @@ function CountryProfileView({
                   <article key={event.id}>
                     <header>
                       <strong>{event.title}</strong>
-                      <span>{event.gameDate}</span>
+                      <time dateTime={event.gameDate}>
+                        {formatCalendarDate(event.gameDate, i18n.language, 'medium')}
+                      </time>
                     </header>
                     <p>{event.description}</p>
                   </article>

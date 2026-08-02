@@ -405,12 +405,16 @@ class FakeProvider implements LlmProvider {
       const turnInput = JSON.parse(request.user) as {
         timeJump?: { strategy?: string; amount?: number };
         playerNation?: { code?: string };
+        imposedFacts?: Array<{ id?: string }>;
       };
       return {
         text: JSON.stringify({
           ...(turnInput.timeJump?.strategy === 'next_major_event'
             ? { time_advance_amount: Math.min(1, turnInput.timeJump.amount ?? 1) }
             : {}),
+          resolved_imposed_action_ids: (turnInput.imposedFacts ?? []).flatMap((fact) =>
+            fact.id ? [fact.id] : [],
+          ),
           events: [
             {
               title: french ? 'Situation stratégique actualisée' : 'Strategic situation updated',

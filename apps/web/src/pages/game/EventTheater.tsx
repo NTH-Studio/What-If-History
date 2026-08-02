@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { GameEvent } from '@what-if-history/contracts';
 import { api } from '../../api';
+import { formatCalendarDate } from '../../dateFormatting';
 import styles from '../../styles/App.module.css';
 
 export function EventTheater({
@@ -25,14 +26,15 @@ export function EventTheater({
   onClose: () => void;
   onIntervene: () => void;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const formattedDate = formatCalendarDate(event.gameDate, i18n.language, 'long');
   const queryClient = useQueryClient();
   const [animationsSkipped, setAnimationsSkipped] = useState(false);
   const saveMutation = useMutation({
     mutationFn: () =>
       api.createSnapshot(
         gameId,
-        t('eventTheater.snapshotLabel', { date: event.gameDate, position: index + 1 }),
+        t('eventTheater.snapshotLabel', { date: formattedDate, position: index + 1 }),
       ),
     onSuccess: async () => queryClient.invalidateQueries({ queryKey: ['snapshots', gameId] }),
   });
@@ -94,13 +96,14 @@ export function EventTheater({
   return (
     <section
       className={`${styles.eventTheater} ${animationsSkipped ? styles.motionSkipped : ''}`}
+      data-testid="event-theater"
       aria-labelledby="event-theater-title"
       aria-live="polite"
     >
       <header className={styles.eventTheaterHeader}>
         <div>
           <span>{t('eventTheater.progress', { current: index + 1, total })}</span>
-          <span>{event.gameDate}</span>
+          <time dateTime={event.gameDate}>{formattedDate}</time>
         </div>
         <button type="button" aria-label={t('common.close')} onClick={onClose}>
           <X size={18} />

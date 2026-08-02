@@ -148,7 +148,11 @@ export function createApp(options: CreateAppOptions = {}) {
 
   if (fs.existsSync(webDirectory)) {
     app.use(express.static(webDirectory, { index: false }));
+    app.use('/assets', (_req, res) => {
+      res.status(404).type('text/plain').send('Asset not found. Reload the application.');
+    });
     app.get('*splat', (_req, res) => {
+      res.setHeader('Cache-Control', 'no-store');
       res.sendFile(path.join(webDirectory, 'index.html'));
     });
   }

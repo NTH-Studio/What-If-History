@@ -5,6 +5,9 @@ const e2eDatabasePath = `data/runtime/e2e-${Date.now()}.sqlite`;
 export default defineConfig({
   testDir: './tests/e2e',
   fullyParallel: false,
+  // AI settings are intentionally global server state. Keep browser projects serialized so one
+  // viewport cannot replace another viewport's provider while a launch is still in progress.
+  workers: 1,
   use: {
     baseURL: 'http://127.0.0.1:3100',
     trace: 'retain-on-failure',

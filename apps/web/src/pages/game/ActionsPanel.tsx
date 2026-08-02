@@ -2,9 +2,9 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   MapPin,
   Pencil,
-  ScrollText,
   Send,
   Search,
+  ShieldCheck,
   Sparkles,
   Trash2,
   WandSparkles,
@@ -13,7 +13,7 @@ import {
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import ReactMarkdown from 'react-markdown';
-import type { Action, ActionPreview } from '@what-if-history/contracts';
+import type { Action, ActionMode, ActionPreview } from '@what-if-history/contracts';
 import { api, ApiError } from '../../api';
 import { ConfirmDialog, Modal } from '../../components/Dialogs';
 import type { MapSelection } from '../../components/MapView';
@@ -34,21 +34,19 @@ export function ActionsPanel({
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [text, setText] = useState('');
-  const [type, setType] = useState<Action['actionType']>('general');
   const [suggestions, setSuggestions] = useState('');
   const [deleteId, setDeleteId] = useState<string>();
   const [editAction, setEditAction] = useState<Action>();
-  const [lawConfirmationOpen, setLawConfirmationOpen] = useState(false);
   const [preview, setPreview] = useState<ActionPreview>();
   const [previewContext, setPreviewContext] = useState<{
     regionId?: string;
     nationCode?: string;
   }>({});
   const createMutation = useMutation({
-    mutationFn: (confirmed: ActionPreview) =>
+    mutationFn: ({ confirmed, mode }: { confirmed: ActionPreview; mode: ActionMode }) =>
       api.createAction(gameId, {
         actionText: text,
-        actionType: type,
+        mode,
         effects: confirmed.effects,
         previewWorldRevision: confirmed.worldRevision,
       }),
@@ -60,16 +58,9 @@ export function ActionsPanel({
     },
   });
   const previewMutation = useMutation({
-    mutationFn: ({
-      actionType,
-      context,
-    }: {
-      actionType: Action['actionType'];
-      context: { regionId?: string; nationCode?: string };
-    }) =>
+    mutationFn: (context: { regionId?: string; nationCode?: string }) =>
       api.previewAction(gameId, {
         actionText: text,
-        actionType,
         context: {
           ...(mapSelection?.regionId ? { regionId: mapSelection.regionId } : {}),
           ...context,
@@ -77,10 +68,15 @@ export function ActionsPanel({
       }),
     onSuccess: setPreview,
   });
-  const previewFor = async (actionType: Action['actionType'], context = previewContext) => {
-    const result = await previewMutation.mutateAsync({ actionType, context });
+  const previewFor = async (context = previewContext) => {
+    const result = await previewMutation.mutateAsync(context);
     setPreviewContext(context);
     return result;
+  };
+  const submit = (mode: ActionMode) => {
+    void previewFor().then((confirmed) => {
+      if (!confirmed.ambiguities.length) createMutation.mutate({ confirmed, mode });
+    });
   };
   const brainstormMutation = useMutation({
     mutationFn: () => api.brainstorm(gameId),
@@ -94,7 +90,7 @@ export function ActionsPanel({
     },
   });
   const updateMutation = useMutation({
-    mutationFn: async (input: { actionText: string; actionType: Action['actionType'] }) => {
+    mutationFn: async (input: { actionText: string; mode: ActionMode }) => {
       const resolved = await api.previewAction(gameId, input);
       if (resolved.ambiguities.length) throw new Error(t('actions.ambiguity'));
       return api.updateAction(gameId, editAction!.id, {
@@ -106,25 +102,6 @@ export function ActionsPanel({
     onSuccess: async () => {
       setEditAction(undefined);
       await queryClient.invalidateQueries({ queryKey: ['actions', gameId] });
-    },
-  });
-  const lawMutation = useMutation({
-    mutationFn: (confirmed: ActionPreview) =>
-      api.promulgateLaw(gameId, {
-        actionText: text,
-        effects: confirmed.effects,
-        previewWorldRevision: confirmed.worldRevision,
-      }),
-    onSuccess: async () => {
-      setText('');
-      setPreview(undefined);
-      setPreviewContext({});
-      setLawConfirmationOpen(false);
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ['actions', gameId] }),
-        queryClient.invalidateQueries({ queryKey: ['countries', gameId] }),
-        queryClient.invalidateQueries({ queryKey: ['country', gameId] }),
-      ]);
     },
   });
   const suggestionItems = suggestions
@@ -170,9 +147,7 @@ export function ActionsPanel({
         className={styles.commandForm}
         onSubmit={(event) => {
           event.preventDefault();
-          void previewFor(type).then((confirmed) => {
-            if (!confirmed.ambiguities.length) createMutation.mutate(confirmed);
-          });
+          submit('planned');
         }}
       >
         {mapSelection ? (
@@ -214,28 +189,12 @@ export function ActionsPanel({
           required
         />
         <div className={styles.commandFooter}>
-          <label className={styles.commandTypeField}>
-            <span>{t('actions.type')}</span>
-            <select
-              value={type}
-              onChange={(event) => {
-                setType(event.target.value as Action['actionType']);
-                setPreview(undefined);
-              }}
-            >
-              {(['general', 'military', 'diplomatic', 'economic'] as const).map((value) => (
-                <option value={value} key={value}>
-                  {t(`actions.${value}`)}
-                </option>
-              ))}
-            </select>
-          </label>
           <div className={styles.commandActions} data-testid="action-buttons">
             <button
               type="button"
               className={styles.button}
               disabled={!text.trim() || previewMutation.isPending}
-              onClick={() => void previewFor(type)}
+              onClick={() => void previewFor()}
             >
               <Search size={17} />
               <span>{t('actions.preview')}</span>
@@ -253,43 +212,46 @@ export function ActionsPanel({
             </button>
             <button
               type="button"
-              className={`${styles.button} ${styles.lawButton}`}
-              aria-label={t('actions.promulgate')}
-              title={t('actions.promulgate')}
-              disabled={!text.trim() || lawMutation.isPending || createMutation.isPending}
-              onClick={() => {
-                void previewFor('law').then((confirmed) => {
-                  if (!confirmed.ambiguities.length) setLawConfirmationOpen(true);
-                });
-              }}
+              className={styles.button}
+              aria-label={t('actions.impose')}
+              title={t('actions.imposeHelp')}
+              disabled={!text.trim() || previewMutation.isPending || createMutation.isPending}
+              onClick={() => submit('imposed')}
             >
-              <ScrollText size={17} />
-              <span>{t('actions.promulgateShort')}</span>
+              <ShieldCheck size={17} />
+              <span>{t('actions.impose')}</span>
             </button>
             <button
               className={styles.primaryButton}
-              aria-label={t('actions.submit')}
-              title={t('actions.submit')}
-              disabled={!text.trim() || createMutation.isPending || lawMutation.isPending}
+              aria-label={t('actions.plan')}
+              title={t('actions.planHelp')}
+              disabled={!text.trim() || previewMutation.isPending || createMutation.isPending}
             >
               <Send size={17} />
-              <span>{t('actions.submitShort')}</span>
+              <span>{t('actions.plan')}</span>
             </button>
+          </div>
+          <div className={styles.actionModeHelp} aria-live="polite">
+            <p>
+              <strong>{t('actions.plan')} :</strong> {t('actions.planHelp')}
+            </p>
+            <p>
+              <strong>{t('actions.impose')} :</strong> {t('actions.imposeHelp')}
+            </p>
           </div>
         </div>
       </form>
-      {createMutation.isError || previewMutation.isError || lawMutation.isError ? (
+      {createMutation.isError || previewMutation.isError ? (
         <p role="alert" className={styles.errorMessage}>
           {(() => {
-            const error =
-              createMutation.error ?? previewMutation.error ?? lawMutation.error ?? undefined;
+            const error = createMutation.error ?? previewMutation.error ?? undefined;
             return error instanceof ApiError ? error.problem.detail : t('common.error');
           })()}
         </p>
       ) : null}
       {preview ? (
         <section className={styles.actionPreview} aria-live="polite">
-          <strong>{t('actions.understoodEffects')}</strong>
+          <strong>{t('actions.interpretedEffects')}</strong>
           {preview.effects.length ? (
             <ul>
               {preview.effects.map((effect, index) => (
@@ -305,7 +267,7 @@ export function ActionsPanel({
               ))}
             </ul>
           ) : (
-            <p>{t('actions.noGuaranteedEffect')}</p>
+            <p>{t('actions.noInterpretedEffect')}</p>
           )}
           {preview.warnings.map((warning) => (
             <small key={warning}>{warning}</small>
@@ -328,7 +290,7 @@ export function ActionsPanel({
                               ? { nationCode: candidate.id }
                               : {}),
                         };
-                        void previewFor(preview.actionType as Action['actionType'], context);
+                        void previewFor(context);
                       }}
                     >
                       {candidate.label}
@@ -374,16 +336,10 @@ export function ActionsPanel({
             <header>
               <span>
                 {t(
-                  `actions.${
-                    action.actionType === 'law'
-                      ? action.status === 'pending'
-                        ? 'enacted'
-                        : 'enactedProcessed'
-                      : action.status
-                  }`,
+                  `actions.${action.mode}${action.status === 'pending' ? 'Pending' : 'Completed'}`,
                 )}
               </span>
-              <span>{t(`actions.${action.actionType}`)}</span>
+              <span>{t(`actions.${action.mode}`)}</span>
             </header>
             <p>{action.actionText}</p>
             {action.effects.length ? (
@@ -401,10 +357,16 @@ export function ActionsPanel({
                 ))}
               </ul>
             ) : (
-              <small>{t('actions.noGuaranteedEffect')}</small>
+              <small>
+                {t(
+                  action.mode === 'imposed'
+                    ? 'actions.imposedWithoutStructuredEffect'
+                    : 'actions.noInterpretedEffect',
+                )}
+              </small>
             )}
             {action.aiResponse ? <small>{action.aiResponse}</small> : null}
-            {action.status === 'pending' && action.actionType !== 'law' ? (
+            {action.status === 'pending' ? (
               <footer className={styles.cardActions}>
                 <button className={styles.button} onClick={() => setEditAction(action)}>
                   <Pencil size={15} />
@@ -419,20 +381,6 @@ export function ActionsPanel({
           </article>
         ))}
       </div>
-      <ConfirmDialog
-        open={lawConfirmationOpen}
-        onOpenChange={setLawConfirmationOpen}
-        title={t('actions.promulgateTitle')}
-        description={t('actions.promulgateDescription')}
-        confirmLabel={t('actions.promulgateConfirm')}
-        onConfirm={async () => {
-          const confirmed =
-            preview?.actionType === 'law' && preview.actionText === text
-              ? preview
-              : await previewFor('law');
-          if (!confirmed.ambiguities.length) await lawMutation.mutateAsync(confirmed);
-        }}
-      />
       <Modal
         open={Boolean(editAction)}
         onOpenChange={(open) => !open && setEditAction(undefined)}
@@ -447,14 +395,14 @@ export function ActionsPanel({
               const data = new FormData(event.currentTarget);
               updateMutation.mutate({
                 actionText: String(data.get('actionText')),
-                actionType: data.get('actionType') as Action['actionType'],
+                mode: data.get('mode') as ActionMode,
               });
             }}
           >
             <label>
-              <span>{t('actions.type')}</span>
-              <select name="actionType" defaultValue={editAction.actionType}>
-                {(['general', 'military', 'diplomatic', 'economic'] as const).map((value) => (
+              <span>{t('actions.mode')}</span>
+              <select name="mode" defaultValue={editAction.mode}>
+                {(['planned', 'imposed'] as const).map((value) => (
                   <option value={value} key={value}>
                     {t(`actions.${value}`)}
                   </option>
@@ -481,7 +429,7 @@ export function ActionsPanel({
         open={Boolean(deleteId)}
         onOpenChange={(open) => !open && setDeleteId(undefined)}
         title={t('common.delete')}
-        description={t('home.deleteDescription')}
+        description={t('actions.deleteDescription')}
         confirmLabel={t('common.delete')}
         onConfirm={async () => {
           if (deleteId) await deleteMutation.mutateAsync(deleteId);

@@ -4,7 +4,7 @@ import { CircleMarker, MapContainer, SVGOverlay, Tooltip, useMap } from 'react-l
 import { type SyntheticEvent, useEffect } from 'react';
 import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Crosshair, Flag, Minus, Plus, X } from 'lucide-react';
+import { Crosshair, Flag, Layers3, Minus, Plus, X } from 'lucide-react';
 import type {
   EventMapCue,
   MapFeature,
@@ -24,7 +24,7 @@ import {
 } from './mapCoordinates';
 import {
   StrategicCommandPanel,
-  StrategicLayerControl,
+  strategicLayerOptions,
   StrategicMapOverlays,
   type StrategicLayer,
 } from './StrategicMapUi';
@@ -237,6 +237,11 @@ export default function MapView({
             homeBounds={focusBounds}
             showClaims={showClaims}
             onToggleClaims={() => setShowClaims((current) => !current)}
+            strategicLayer={strategicLayer}
+            onStrategicLayerChange={(layer) => {
+              setStrategicLayer(layer);
+              localStorage.setItem(`what-if-history-strategic-layer:${gameId}`, layer);
+            }}
           />
           <EventViewport
             cue={focusCue}
@@ -492,13 +497,6 @@ export default function MapView({
           ) : null}
         </MapContainer>
       </section>
-      <StrategicLayerControl
-        active={strategicLayer}
-        onChange={(layer) => {
-          setStrategicLayer(layer);
-          localStorage.setItem(`what-if-history-strategic-layer:${gameId}`, layer);
-        }}
-      />
       {strategic.data && selectedUnitId ? (
         <StrategicCommandPanel
           gameId={gameId}
@@ -767,14 +765,19 @@ function MapControls({
   homeBounds,
   showClaims,
   onToggleClaims,
+  strategicLayer,
+  onStrategicLayerChange,
 }: {
   homeBounds: LeafletBounds | undefined;
   showClaims: boolean;
   onToggleClaims: () => void;
+  strategicLayer: StrategicLayer;
+  onStrategicLayerChange: (layer: StrategicLayer) => void;
 }) {
   const map = useMap();
   const { t } = useTranslation();
   const [zoom, setZoom] = useState(() => map.getZoom());
+  const [layerMenuOpen, setLayerMenuOpen] = useState(false);
   const stopPropagation = (event: SyntheticEvent) => event.stopPropagation();
 
   useEffect(() => {
@@ -840,6 +843,39 @@ function MapControls({
       >
         <Flag size={17} />
       </button>
+      <span className={styles.mapControlsDivider} aria-hidden="true" />
+      <div className={styles.strategicLayerControl} data-expanded={layerMenuOpen}>
+        <button
+          type="button"
+          className={styles.strategicLayerToggle}
+          aria-label={t('strategic.layers.open')}
+          aria-expanded={layerMenuOpen}
+          onClick={() => setLayerMenuOpen((current) => !current)}
+        >
+          <Layers3 size={18} />
+          <span>{t('strategic.layers.title')}</span>
+        </button>
+        {layerMenuOpen ? (
+          <div role="radiogroup" aria-label={t('strategic.layers.title')}>
+            {strategicLayerOptions.map(({ id, icon: Icon, label }) => (
+              <button
+                type="button"
+                role="radio"
+                aria-checked={strategicLayer === id}
+                data-active={strategicLayer === id}
+                key={id}
+                onClick={() => {
+                  onStrategicLayerChange(id);
+                  setLayerMenuOpen(false);
+                }}
+              >
+                <Icon size={16} />
+                <span>{t(label)}</span>
+              </button>
+            ))}
+          </div>
+        ) : null}
+      </div>
     </div>
   );
 }

@@ -232,7 +232,8 @@ export type GeneratedCharacterChange = z.infer<typeof generatedCharacterChangeSc
 
 export const generatedTurnSchema = z.object({
   time_advance_amount: z.number().int().positive().max(365).optional(),
-  events: z.array(generatedEventSchema).max(20),
+  resolved_imposed_action_ids: z.array(uuidSchema).max(100).default([]),
+  events: z.array(generatedEventSchema).max(6),
   law_changes: z.array(generatedLawChangeSchema).max(20).default([]),
   region_changes: z.array(regionChangeSchema).max(100).default([]),
   unit_changes: z.array(generatedUnitChangeSchema).max(100).default([]),

@@ -1,5 +1,11 @@
 import { z } from 'zod';
-import { isoDateSchema, isoDateTimeSchema, timeJumpSchema, uuidSchema } from './common.js';
+import {
+  gameSchema,
+  isoDateSchema,
+  isoDateTimeSchema,
+  timeJumpSchema,
+  uuidSchema,
+} from './common.js';
 import { gameEventSchema } from './events.js';
 
 export const llmProviderSchema = z.enum([
@@ -157,3 +163,9 @@ export const turnResultSchema = z.object({
   appliedMutations: z.array(appliedMutationSchema),
 });
 export type TurnResult = z.infer<typeof turnResultSchema>;
+
+export const campaignLaunchResultSchema = gameSchema.extend({
+  game: gameSchema,
+  openingTurn: turnResultSchema,
+});
+export type CampaignLaunchResult = z.infer<typeof campaignLaunchResultSchema>;

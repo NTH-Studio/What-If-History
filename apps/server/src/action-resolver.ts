@@ -99,28 +99,6 @@ export class ActionEffectResolver {
     const warnings: string[] = [];
 
     if (!operation) {
-      if (input.actionType === 'law') {
-        const game = this.advanced.database
-          .prepare('SELECT player_nation_code FROM games WHERE id = ?')
-          .get(gameId) as { player_nation_code?: string } | undefined;
-        return {
-          actionText: input.actionText,
-          actionType: input.actionType,
-          effects: [
-            {
-              kind: 'law',
-              operation: 'enact',
-              nationCode: String(game?.player_nation_code ?? ''),
-              title: input.actionText,
-              summary: '',
-              category: 'other',
-            },
-          ],
-          ambiguities,
-          warnings,
-          worldRevision: this.currentRevision(gameId),
-        };
-      }
       warnings.push(
         language === 'en'
           ? 'No guaranteed world change was identified. The order may still produce simulated consequences.'
@@ -128,7 +106,6 @@ export class ActionEffectResolver {
       );
       return {
         actionText: input.actionText,
-        actionType: input.actionType,
         effects: [],
         ambiguities,
         warnings,
@@ -171,7 +148,6 @@ export class ActionEffectResolver {
 
     return {
       actionText: input.actionText,
-      actionType: input.actionType,
       effects:
         region && nationCode
           ? [{ kind: 'territory', operation, regionId: region.regionId, nationCode }]

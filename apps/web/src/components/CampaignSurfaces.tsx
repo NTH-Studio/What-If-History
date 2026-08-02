@@ -16,6 +16,7 @@ import { useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { TimeJump, TurnResult, TurnRun } from '@what-if-history/contracts';
 import { ApiError, api, createRequestId } from '../api';
+import { formatCalendarDate, formatTimestamp } from '../dateFormatting';
 import styles from '../styles/App.module.css';
 
 export type TimeJumpDraft = Required<Pick<TimeJump, 'amount' | 'unit' | 'strategy'>>;
@@ -108,10 +109,7 @@ export function TimeAdvanceDialog({
   });
   const preview = useMemo(() => targetDate(currentDate, jump), [currentDate, jump]);
   const formattedPreview = useMemo(
-    () =>
-      new Intl.DateTimeFormat(i18n.language, { dateStyle: 'long' }).format(
-        new Date(`${preview}T12:00:00Z`),
-      ),
+    () => formatCalendarDate(preview, i18n.language),
     [i18n.language, preview],
   );
 
@@ -292,10 +290,6 @@ export function SimulationHistoryPanel({
     queryFn: () => api.turnRuns(gameId),
   });
   const visibleRuns = (runs.data ?? []).filter((run) => filter === 'all' || run.status === filter);
-  const dateFormatter = useMemo(
-    () => new Intl.DateTimeFormat(i18n.language, { dateStyle: 'short', timeStyle: 'short' }),
-    [i18n.language],
-  );
 
   return (
     <div className={styles.historyPanel} data-testid="simulation-history">
@@ -342,7 +336,7 @@ export function SimulationHistoryPanel({
               </div>
               <div>
                 <span>{t('timeline.started')}</span>
-                <strong>{dateFormatter.format(new Date(run.startedAt))}</strong>
+                <strong>{formatTimestamp(run.startedAt, i18n.language)}</strong>
               </div>
               <div>
                 <span>{t('timeline.duration')}</span>

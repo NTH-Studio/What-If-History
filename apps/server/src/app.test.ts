@@ -24,6 +24,69 @@ describe('API v1', () => {
     context.database.close();
   });
 
+  it('simulates and persists the first campaign day during launch', async () => {
+    const launched = await request(context.app)
+      .post('/api/v1/games/start')
+      .set('x-what-if-history-language', 'fr')
+      .send({ nationCode: 'FRA', startDate: '1936-01-01' })
+      .expect(201);
+
+    expect(launched.body).toMatchObject({
+      id: expect.any(String),
+      currentDate: '1936-01-02',
+      turnNumber: 2,
+      game: {
+        currentDate: '1936-01-02',
+        turnNumber: 2,
+        eventCount: 1,
+        worldRevision: 1,
+      },
+      openingTurn: {
+        previousDate: '1936-01-01',
+        newDate: '1936-01-02',
+        turnNumber: 2,
+        events: [
+          expect.objectContaining({
+            gameDate: '1936-01-02',
+            title: 'Situation stratégique actualisée',
+          }),
+        ],
+      },
+    });
+    expect(launched.body.id).toBe(launched.body.game.id);
+    expect(context.repository.listEvents(launched.body.game.id)).toContainEqual(
+      expect.objectContaining({
+        gameDate: '1936-01-02',
+        turnNumber: 1,
+        title: 'Situation stratégique actualisée',
+      }),
+    );
+    expect(
+      context.repository.listLlmCalls({ gameId: launched.body.game.id, limit: 10 }),
+    ).toContainEqual(expect.objectContaining({ type: 'turn_generation', status: 'succeeded' }));
+  });
+
+  it('does not keep an incomplete campaign when the opening AI simulation fails', async () => {
+    context.repository.saveLlmSettings({
+      provider: 'openai',
+      apiUrl: 'http://127.0.0.1:9/v1',
+      apiKey: 'unreachable-test-key',
+      model: 'unreachable-opening-turn',
+      clearApiKey: false,
+    });
+
+    await request(context.app)
+      .post('/api/v1/games/start')
+      .send({ nationCode: 'FRA', startDate: '1936-01-01' })
+      .expect(502)
+      .expect(({ body }) => expect(body.code).toBe('LLM_UNREACHABLE'));
+
+    await request(context.app)
+      .get('/api/v1/games')
+      .expect(200)
+      .expect(({ body }) => expect(body).toEqual([]));
+  });
+
   it('serves complete estimated profiles for every country without internal catalog fields', async () => {
     const created = await request(context.app)
       .post('/api/v1/games')
@@ -365,7 +428,7 @@ describe('API v1', () => {
 
     await request(context.app)
       .post(`/api/v1/games/${created.body.id}/actions`)
-      .send({ actionText: 'Reinforce the eastern frontier.', actionType: 'military' })
+      .send({ actionText: 'Reinforce the eastern frontier.', mode: 'planned' })
       .expect(201);
 
     const turn = await request(context.app)
@@ -854,7 +917,7 @@ describe('API v1', () => {
     expect(created.body.worldContext).not.toContain('1936');
   });
 
-  it('keeps an AI feasibility rejection consultative instead of vetoing the player', async () => {
+  it('queues a planned attempt without calling AI validation', async () => {
     const created = await request(context.app)
       .post('/api/v1/games')
       .send({ nationCode: 'FRA', startDate: '2000-01-01' })
@@ -863,18 +926,19 @@ describe('API v1', () => {
     const action = await request(context.app)
       .post(`/api/v1/games/${created.body.id}/actions`)
       .set('x-what-if-history-language', 'fr')
-      .send({ actionText: 'FORCE_REJECT_FOR_TEST', actionType: 'general' })
+      .send({ actionText: 'FORCE_REJECT_FOR_TEST', mode: 'planned' })
       .expect(201);
 
     expect(action.body).toMatchObject({
       status: 'pending',
-      effectStatus: 'queued',
+      mode: 'planned',
+      effectStatus: 'resolved',
     });
-    expect(action.body.aiResponse).toContain('Avis consultatif de l’IA');
-    expect(action.body.aiResponse).toContain('Avertissement de faisabilité simulé');
+    expect(action.body.aiResponse).toContain('La simulation décidera de sa réussite');
+    expect(context.repository.listLlmCalls({ gameId: created.body.id, limit: 10 })).toHaveLength(0);
   });
 
-  it('previews and applies giving Paris to Germany on the next turn only', async () => {
+  it('previews and applies an imposed Paris cession on the next turn only', async () => {
     const created = await request(context.app)
       .post('/api/v1/games')
       .send({ nationCode: 'FRA', startDate: '1936-01-01' })
@@ -884,7 +948,7 @@ describe('API v1', () => {
     const preview = await request(context.app)
       .post(`/api/v1/games/${gameId}/actions/preview`)
       .set('x-what-if-history-language', 'fr')
-      .send({ actionText: "donner Paris à l'Allemagne", actionType: 'general' })
+      .send({ actionText: "donner Paris à l'Allemagne" })
       .expect(200);
 
     expect(preview.body).toMatchObject({
@@ -904,12 +968,13 @@ describe('API v1', () => {
       .post(`/api/v1/games/${gameId}/actions`)
       .send({
         actionText: "donner Paris à l'Allemagne",
-        actionType: 'general',
+        mode: 'imposed',
         effects: preview.body.effects,
         previewWorldRevision: preview.body.worldRevision,
       })
       .expect(201);
     expect(action.body.effectStatus).toBe('queued');
+    expect(action.body.mode).toBe('imposed');
 
     const beforeTurn = await request(context.app)
       .get(`/api/v1/games/${gameId}/world/regions`)
@@ -962,6 +1027,42 @@ describe('API v1', () => {
     ).toMatchObject({ nationCode: 'GER', featureType: 'city', regionId: 'Ile_de_France' });
   });
 
+  it('keeps detected effects of a planned order as non-guaranteed intentions', async () => {
+    const created = await request(context.app)
+      .post('/api/v1/games')
+      .send({ nationCode: 'FRA', startDate: '1936-01-01' })
+      .expect(201);
+    const gameId = created.body.id as string;
+    const preview = await request(context.app)
+      .post(`/api/v1/games/${gameId}/actions/preview`)
+      .send({ actionText: "donner Paris à l'Allemagne" })
+      .expect(200);
+    const action = await request(context.app)
+      .post(`/api/v1/games/${gameId}/actions`)
+      .send({
+        actionText: "donner Paris à l'Allemagne",
+        mode: 'planned',
+        effects: preview.body.effects,
+        previewWorldRevision: preview.body.worldRevision,
+      })
+      .expect(201);
+
+    expect(action.body).toMatchObject({ mode: 'planned', effectStatus: 'resolved' });
+    const turn = await request(context.app)
+      .post(`/api/v1/games/${gameId}/turns`)
+      .send({ amount: 1, unit: 'month' })
+      .expect(201);
+    expect(turn.body.appliedMutations).not.toContainEqual(
+      expect.objectContaining({ sourceActionId: action.body.id }),
+    );
+    const regions = await request(context.app)
+      .get(`/api/v1/games/${gameId}/world/regions`)
+      .expect(200);
+    expect(
+      regions.body.find((region: { regionId: string }) => region.regionId === 'Ile_de_France'),
+    ).toMatchObject({ ownerNationCode: 'FRA', controllerNationCode: 'FRA' });
+  });
+
   it('recognizes England without treating the selected region owner as the recipient', async () => {
     const created = await request(context.app)
       .post('/api/v1/games')
@@ -973,7 +1074,6 @@ describe('API v1', () => {
       .set('x-what-if-history-language', 'fr')
       .send({
         actionText: "donner a l'Angleterre\n\nContexte cartographique : ★ Paris (FRA).",
-        actionType: 'general',
         context: { regionId: 'Ile_de_France' },
       })
       .expect(200);
@@ -994,7 +1094,7 @@ describe('API v1', () => {
       .post(`/api/v1/games/${created.body.id}/actions`)
       .send({
         actionText: preview.body.actionText,
-        actionType: 'general',
+        mode: 'planned',
         effects: preview.body.effects,
         previewWorldRevision: preview.body.worldRevision,
       })
@@ -1002,7 +1102,8 @@ describe('API v1', () => {
 
     expect(action.body).toMatchObject({
       status: 'pending',
-      effectStatus: 'queued',
+      mode: 'planned',
+      effectStatus: 'resolved',
       effects: preview.body.effects,
     });
     expect(
@@ -1012,7 +1113,7 @@ describe('API v1', () => {
     ).toHaveLength(0);
   });
 
-  it('accepts an ambiguous v3 action without inventing a guaranteed world effect', async () => {
+  it('rejects an ambiguous action until its target is clarified', async () => {
     const created = await request(context.app)
       .post('/api/v1/games')
       .send({ nationCode: 'FRA', startDate: '1936-01-01' })
@@ -1020,14 +1121,10 @@ describe('API v1', () => {
 
     const action = await request(context.app)
       .post(`/api/v1/games/${created.body.id}/actions`)
-      .send({ actionText: "donner a l'Angleterre", actionType: 'general' })
-      .expect(201);
+      .send({ actionText: "donner a l'Angleterre", mode: 'planned' })
+      .expect(422);
 
-    expect(action.body).toMatchObject({
-      actionText: "donner a l'Angleterre",
-      effects: [],
-      previewWorldRevision: 0,
-    });
+    expect(action.body.code).toBe('ACTION_EFFECT_AMBIGUOUS');
   });
 
   it('returns the same committed turn for a repeated idempotency key', async () => {
@@ -1064,14 +1161,14 @@ describe('API v1', () => {
     const queue = async (actionText: string) => {
       const preview = await request(context.app)
         .post(`/api/v1/games/${gameId}/actions/preview`)
-        .send({ actionText, actionType: 'general' })
+        .send({ actionText })
         .expect(200);
       expect(preview.body.ambiguities).toEqual([]);
       await request(context.app)
         .post(`/api/v1/games/${gameId}/actions`)
         .send({
           actionText,
-          actionType: 'general',
+          mode: 'imposed',
           effects: preview.body.effects,
           previewWorldRevision: preview.body.worldRevision,
         })
@@ -1148,7 +1245,7 @@ describe('API v1', () => {
     const gameId = created.body.id as string;
     const preview = await request(context.app)
       .post(`/api/v1/games/${gameId}/actions/preview`)
-      .send({ actionText: "donner Paris à l'Allemagne", actionType: 'general' })
+      .send({ actionText: "donner Paris à l'Allemagne" })
       .expect(200);
 
     await request(context.app)
@@ -1160,7 +1257,7 @@ describe('API v1', () => {
       .post(`/api/v1/games/${gameId}/actions`)
       .send({
         actionText: "donner Paris à l'Allemagne",
-        actionType: 'general',
+        mode: 'imposed',
         effects: preview.body.effects,
         previewWorldRevision: preview.body.worldRevision,
       })
@@ -1281,36 +1378,57 @@ describe('API v1', () => {
     expect(context.repository.listGames()).toHaveLength(0);
   });
 
-  it('promulgates a law without AI validation or a vote and simulates it next turn', async () => {
+  it('keeps an imposed free-form fact generic, editable and guaranteed for the next turn', async () => {
     const created = await request(context.app)
       .post('/api/v1/games')
       .send({ nationCode: 'FRA', startDate: '1936-01-01' })
       .expect(201);
 
-    const law = await request(context.app)
-      .post(`/api/v1/games/${created.body.id}/actions/promulgate-law`)
+    const imposed = await request(context.app)
+      .post(`/api/v1/games/${created.body.id}/actions`)
       .set('x-what-if-history-language', 'fr')
-      .send({ actionText: 'Rendre la vaccination obligatoire.' })
+      .send({ actionText: 'Macron meurt étouffé par un os de poulet.', mode: 'imposed' })
       .expect(201);
 
-    expect(law.body).toMatchObject({
-      actionText: 'Rendre la vaccination obligatoire.',
-      actionType: 'law',
+    expect(imposed.body).toMatchObject({
+      actionText: 'Macron meurt étouffé par un os de poulet.',
+      actionType: 'general',
+      mode: 'imposed',
       status: 'pending',
-      aiResponse:
-        'Promulguée sans vote. La loi est mise en file et entrera en vigueur au prochain tour.',
+      effects: [],
+      effectStatus: 'queued',
     });
+    expect(imposed.body.aiResponse).toContain('Ce fait est garanti au prochain tour');
     const beforeTurn = await request(context.app)
       .get(`/api/v1/games/${created.body.id}/countries/FRA`)
       .expect(200);
     expect(beforeTurn.body.laws).not.toContainEqual(
-      expect.objectContaining({ title: 'Rendre la vaccination obligatoire.' }),
+      expect.objectContaining({ title: 'Macron meurt étouffé par un os de poulet.' }),
     );
     expect(context.repository.listLlmCalls({ limit: 100 })).toHaveLength(0);
 
+    const edited = await request(context.app)
+      .patch(`/api/v1/games/${created.body.id}/actions/${imposed.body.id}`)
+      .send({
+        actionText: 'Macron meurt étouffé par un os de poulet en public.',
+        mode: 'imposed',
+        effects: [],
+        previewWorldRevision: 0,
+      })
+      .expect(200);
+    expect(edited.body).toMatchObject({
+      actionText: 'Macron meurt étouffé par un os de poulet en public.',
+      mode: 'imposed',
+      aiResponse: null,
+    });
+
+    const removable = await request(context.app)
+      .post(`/api/v1/games/${created.body.id}/actions`)
+      .send({ actionText: 'Déclaration imposée à supprimer.', mode: 'imposed' })
+      .expect(201);
     await request(context.app)
-      .delete(`/api/v1/games/${created.body.id}/actions/${law.body.id}`)
-      .expect(404);
+      .delete(`/api/v1/games/${created.body.id}/actions/${removable.body.id}`)
+      .expect(204);
 
     await request(context.app)
       .post(`/api/v1/games/${created.body.id}/turns`)
@@ -1321,29 +1439,34 @@ describe('API v1', () => {
       .get(`/api/v1/games/${created.body.id}/actions`)
       .expect(200);
     expect(actions.body).toContainEqual(
-      expect.objectContaining({ id: law.body.id, actionType: 'law', status: 'completed' }),
+      expect.objectContaining({
+        id: imposed.body.id,
+        mode: 'imposed',
+        status: 'completed',
+        effectStatus: 'applied',
+      }),
     );
     const afterTurn = await request(context.app)
       .get(`/api/v1/games/${created.body.id}/countries/FRA`)
       .expect(200);
-    expect(afterTurn.body.laws).toContainEqual(
-      expect.objectContaining({
-        title: 'Rendre la vaccination obligatoire.',
-        status: 'active',
-        source: 'player',
-      }),
+    expect(afterTurn.body.laws).not.toContainEqual(
+      expect.objectContaining({ title: 'Macron meurt étouffé par un os de poulet en public.' }),
     );
   });
 
-  it('rejects an empty law promulgation', async () => {
+  it('removes the promulgation route and rejects an empty imposed action', async () => {
     const created = await request(context.app)
       .post('/api/v1/games')
       .send({ nationCode: 'FRA', startDate: '1936-01-01' })
       .expect(201);
 
-    const response = await request(context.app)
+    await request(context.app)
       .post(`/api/v1/games/${created.body.id}/actions/promulgate-law`)
-      .send({ actionText: '   ' })
+      .send({ actionText: 'Ancienne promulgation.' })
+      .expect(404);
+    const response = await request(context.app)
+      .post(`/api/v1/games/${created.body.id}/actions`)
+      .send({ actionText: '   ', mode: 'imposed' })
       .expect(400);
     expect(response.body.code).toBe('VALIDATION_ERROR');
   });
@@ -1481,7 +1604,7 @@ describe('API v1', () => {
     await request(context.app)
       .post(`/api/v1/games/${created.body.id}/actions`)
       .set('x-what-if-history-client-id', clientId)
-      .send({ actionText: secretText, actionType: 'military' })
+      .send({ actionText: secretText, mode: 'planned' })
       .expect(201);
     await request(context.app)
       .post(`/api/v1/games/${created.body.id}/actions/brainstorm`)
@@ -1523,7 +1646,6 @@ describe('API v1', () => {
       .expect(200);
     expect(new Set(activity.body.map((item: { type: string }) => item.type))).toEqual(
       new Set([
-        'action_validation',
         'action_brainstorm',
         'advisor',
         'diplomacy_reply',
@@ -1609,7 +1731,7 @@ describe('API v1', () => {
       .expect(201);
     await request(context.app)
       .post(`/api/v1/games/${created.body.id}/actions`)
-      .send({ actionText: 'Prepare a reserve force.', actionType: 'military' })
+      .send({ actionText: 'Prepare a reserve force.', mode: 'planned' })
       .expect(201);
 
     await request(context.app).delete(`/api/v1/games/${created.body.id}`).expect(204);
@@ -1648,7 +1770,7 @@ describe('API v1', () => {
           case 300:
             content = JSON.stringify({ accepted: true, reason: 'Action accepted.' });
             break;
-          case 1_500:
+          case 4_000:
             content = JSON.stringify({
               time_advance_amount: 7,
               events: [
@@ -1727,7 +1849,7 @@ describe('API v1', () => {
 
       await request(context.app)
         .post(`/api/v1/games/${created.body.id}/actions`)
-        .send({ actionText: 'Reinforce the eastern frontier.', actionType: 'military' })
+        .send({ actionText: 'Reinforce the eastern frontier.', mode: 'planned' })
         .expect(201);
 
       await request(context.app)
@@ -1746,9 +1868,8 @@ describe('API v1', () => {
           );
         });
 
-      expect(receivedPaths).toEqual(['/api/chat', '/api/chat', '/api/chat']);
+      expect(receivedPaths).toEqual(['/api/chat', '/api/chat']);
       expect(receivedAuthorizations).toEqual([
-        'Bearer stored-ollama-key',
         'Bearer stored-ollama-key',
         'Bearer stored-ollama-key',
       ]);
@@ -1758,10 +1879,7 @@ describe('API v1', () => {
       const activity = context.repository
         .listLlmCalls({ gameId: created.body.id, limit: 10 })
         .map((item) => ({ type: item.type, status: item.status, errorCode: item.errorCode }));
-      expect(activity).toEqual([
-        { type: 'turn_generation', status: 'succeeded', errorCode: null },
-        { type: 'action_validation', status: 'succeeded', errorCode: null },
-      ]);
+      expect(activity).toEqual([{ type: 'turn_generation', status: 'succeeded', errorCode: null }]);
     } finally {
       await new Promise<void>((resolve) => provider.close(() => resolve()));
     }
@@ -2057,7 +2175,7 @@ describe('API v1', () => {
 
     const action = await request(context.app)
       .post(`/api/v1/games/${gameId}/actions`)
-      .send({ actionText: 'Prepare the western defenses.', actionType: 'military' })
+      .send({ actionText: 'Prepare the western defenses.', mode: 'planned' })
       .expect(201);
     const editedAction = await request(context.app)
       .patch(`/api/v1/games/${gameId}/actions/${action.body.id}`)
@@ -2196,12 +2314,26 @@ describe('API v1', () => {
       .send({ nationCode: 'FRA' })
       .expect(201);
     expect(launched.body).toMatchObject({
+      id: expect.any(String),
       presetId: preset.body.id,
-      currentDate: '1870-01-01',
-      difficulty: 'hard',
+      currentDate: '1870-01-02',
+      game: {
+        presetId: preset.body.id,
+        currentDate: '1870-01-02',
+        turnNumber: 2,
+        eventCount: 1,
+        difficulty: 'hard',
+      },
+      openingTurn: {
+        previousDate: '1870-01-01',
+        newDate: '1870-01-02',
+        events: [expect.objectContaining({ gameDate: '1870-01-02' })],
+      },
     });
+    expect(launched.body.id).toBe(launched.body.game.id);
+    const launchedGameId = launched.body.game.id;
     const launchedRegions = await request(context.app)
-      .get(`/api/v1/games/${launched.body.id}/world/regions`)
+      .get(`/api/v1/games/${launchedGameId}/world/regions`)
       .expect(200);
     expect(
       launchedRegions.body.find(
@@ -2213,7 +2345,7 @@ describe('API v1', () => {
       claimNationCodes: ['FRA'],
     });
     await request(context.app)
-      .patch(`/api/v1/games/${launched.body.id}/world/regions/Ile_de_France`)
+      .patch(`/api/v1/games/${launchedGameId}/world/regions/Ile_de_France`)
       .send({ ownerNationCode: 'FRA', controllerNationCode: 'FRA', claimNationCodes: [] })
       .expect(200);
     const unchangedPreset = await request(context.app)
