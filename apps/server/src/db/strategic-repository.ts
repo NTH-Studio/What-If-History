@@ -1111,8 +1111,30 @@ export class StrategicRepository {
 
   private inferImpactKind(event: GameEvent): ImpactKind | null {
     const content = `${event.title} ${event.description}`.toLowerCase();
-    if (/nucl[ée]aire|nuclear|atomique|atomic/.test(content)) return 'nuclear_strike';
-    if (/bombard|frappe|missile|artiller/.test(content)) return 'conventional_strike';
+    const classification = `${event.subtype ?? ''} ${event.icon_key ?? ''}`.toLowerCase();
+    const mentionsNuclear = /nucl[ée]aire|nuclear|atomique|atomic/.test(content);
+    const describesNuclearDetonation =
+      /explos|d[ée]ton|champignon atomique|nuclear blast|retomb[ée]es? radioactives?|fallout|irradi[ée]|an[ée]anti|d[ée]truit/.test(
+        content,
+      );
+    const describesNuclearAttack =
+      /(?:frappe|attaque|bombardement|tir|lancement)\s+(?:[\p{L}-]+\s+){0,3}(?:nucl[ée]aire|atomique)|(?:nuclear|atomic)\s+(?:strike|attack|bombing|launch)/u.test(
+        content,
+      );
+    if (
+      /nuclear[_ -]?strike|frappe[_ -]?nucl[ée]aire/.test(classification) ||
+      (mentionsNuclear && (describesNuclearDetonation || describesNuclearAttack))
+    ) {
+      return 'nuclear_strike';
+    }
+    if (
+      /conventional[_ -]?strike/.test(classification) ||
+      /bombardement\s+(?:sur|contre|de)|(?:bombarde|bombard[ée]e?)\s|frappe\s+(?:sur|contre)|missile\s+(?:lanc[ée]|tir[ée]|frappe|atteint|explose)|tirs?\s+d['’]artillerie/.test(
+        content,
+      )
+    ) {
+      return 'conventional_strike';
+    }
     if (/incend|wildfire|firestorm/.test(content)) return 'fire';
     if (/épid[ée]mie|epidemic|pand[ée]mie|pandemic/.test(content)) return 'epidemic';
     if (/famine|starvation/.test(content)) return 'famine';

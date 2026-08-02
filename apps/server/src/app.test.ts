@@ -903,6 +903,67 @@ describe('API v1', () => {
     ).toThrowError(/cible, un vecteur et des effets structurés/);
   });
 
+  it('does not treat a nuclear-powered fleet as a nuclear strike', async () => {
+    const created = await request(context.app)
+      .post('/api/v1/games')
+      .send({ nationCode: 'FRA', startDate: '2000-01-01' })
+      .expect(201);
+    const gameId = created.body.id as string;
+    const eventId = '00000000-0000-4000-8000-000000000224';
+    const event = {
+      id: eventId,
+      gameId,
+      title: "Mise en service d'une flotte à propulsion nucléaire",
+      description:
+        'La marine nationale inaugure une flotte océanique à propulsion nucléaire équipée de missiles, sans action offensive.',
+      event_type: 'military' as const,
+      severity: 'moderate' as const,
+      affected_nations: ['FRA'],
+      state_changes: {},
+      map_cue: {
+        camera: 'nation' as const,
+        locations: [{ kind: 'nation' as const, role: 'primary' as const, nation_code: 'FRA' }],
+      },
+      subtype: 'naval_deployment',
+      icon_key: 'unit-naval',
+      gameDate: '2000-02-01',
+      createdAt: '2000-02-01T00:00:00.000Z',
+      turnNumber: 2,
+    };
+    context.database
+      .prepare(
+        `INSERT INTO events (
+          id, game_id, title, description, event_type, severity, affected_nations,
+          state_changes, map_cue, subtype, icon_key, strategic_effect,
+          game_date, created_at, turn_number
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        event.id,
+        event.gameId,
+        event.title,
+        event.description,
+        event.event_type,
+        event.severity,
+        JSON.stringify(event.affected_nations),
+        '{}',
+        JSON.stringify(event.map_cue),
+        event.subtype,
+        event.icon_key,
+        null,
+        event.gameDate,
+        event.createdAt,
+        event.turnNumber,
+      );
+
+    expect(() => context.strategic.appendEventTimeline(gameId, event)).not.toThrow();
+
+    expect(context.strategic.listTimeline(gameId)).toContainEqual(
+      expect.objectContaining({ eventId, kind: 'event' }),
+    );
+    expect(context.strategic.getState(gameId).impactZones).toHaveLength(0);
+  });
+
   it('uses the requested date in a historical campaign context', async () => {
     const created = await request(context.app)
       .post('/api/v1/games')
